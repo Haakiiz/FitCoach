@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 import httpx
 
 # ─── Load environment from your custom file ───
@@ -39,4 +39,20 @@ async def get_workouts(
     if resp.is_error:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
+
+@app.post("/workouts")
+async def post_workout(payload: dict = Body(...)):
+    """
+    Forward a workout JSON payload to Hevy.
+    The body is passed through unchanged.
+    """
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(
+            f"{BASE}/workouts",
+            headers={"api-key": API_KEY, "accept": "application/json"},
+            json=payload
+        )
+    if r.is_error:
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
 

@@ -1,0 +1,311 @@
+Absolutely! Here’s your full instruction manual—**self-contained, copyable, and beginner-friendly**—so a new user can set up their own Raspberry Pi proxy for connecting HEVY’s API to a Custom GPT (“fitcoach”), with ngrok for HTTPS access.
+
+---
+
+
+# HEVY-GPT Proxy on Raspberry Pi  
+*Reproducible Guide for Connecting Your HEVY Account to a Custom GPT*
+
+---
+
+## 1. Overview
+
+This project lets you connect your Raspberry Pi to the HEVY workout app’s API and securely share your private workout history with your custom GPT (such as fitcoach). The Pi runs a lightweight proxy server that securely fetches your HEVY data (using your API key), and exposes it to ChatGPT via a safe HTTPS web address, so your GPT can retrieve your recent workouts and suggest programs tailored to what you’ve actually done.
+
+---
+
+## 2. Prerequisites
+
+Before you start, make sure you have:
+
+**Hardware/Software**
+- A Raspberry Pi (any recent model, with Raspbian OS).
+- Local network access (wired or WiFi).
+- A Windows, Mac, or Linux PC for first setup/transfer.
+
+**Accounts and Keys**
+- **HEVY Pro account:** [Sign up & subscribe](https://hevy.com) if needed.
+- **HEVY API Key:** Get it at [hevy.com/settings?developer](https://hevy.com/settings?developer).
+- **ngrok account:** [Sign up](https://dashboard.ngrok.com/signup) (free).  
+  _(Optional: reserve a custom subdomain for a fixed public URL.)_
+
+**Custom GPT**
+- A [Custom GPT](https://chat.openai.com/gpts) with Actions enabled, or a similar setup.
+
+---
+
+## 3. Project Files
+
+### `hevy_proxy.py`
+```python
+from dotenv import load_dotenv
+import os
+from fastapi import FastAPI, HTTPException
+import httpx
+
+# Load HEVY API key from .hevy_env
+load_dotenv(dotenv_path=".hevy_env")
+API_KEY = os.getenv("HEVY_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Missing HEVY_API_KEY; check your .hevy_env file")
+
+app = FastAPI()
+BASE = "https://api.hevyapp.com/v1"
+
+@app.get("/workouts")
+async def get_workouts(page: int = 1, pageSize: int = 10, since: str | None = None):
+    # Clamp pageSize to allowed range
+    if pageSize < 1:
+        pageSize = 1
+    elif pageSize > 10:
+        pageSize = 10
+    params = {"page": page, "pageSize": pageSize}
+    if since:
+        params["since"] = since
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{BASE}/workouts",
+            headers={"api-key": API_KEY, "accept": "application/json"},
+            params=params
+        )
+    if resp.is_error:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+```
+
+### `.hevy_env`
+Contents (replace with your real API key):
+```
+HEVY_API_KEY=<YOUR_HEVY_API_KEY>
+```
+
+### `requirements.txt`
+Only direct dependencies:
+```
+fastapi==0.115.12
+uvicorn==0.22.0
+httpx==1.0.0b0
+python-dotenv==1.1.0
+```
+
+---
+
+## 4. Step-by-Step on the Pi
+
+### 4.1 SSH In and Install Python Tools
+
+1. **Open PowerShell or your Terminal. SSH in:**
+   ```sh
+   ssh <YOUR_PI_USER>@<YOUR_PI_IP>
+   ```
+
+2. **Update and install dependencies:**
+   ```sh
+   sudo apt update
+   sudo apt install python3 python3-venv python3-pip
+   ```
+
+### 4.2 Copy Project to Pi
+
+**From your PC (PowerShell):**
+```sh
+scp -r C:\Users\<YourUser>\Path\To\FitCoach <YOUR_PI_USER>@<YOUR_PI_IP>:/home/<YOUR_PI_USER>/
+```
+*(Adjust the path as needed.)*
+
+### 4.3 Setup Virtual Environment and Install Requirements
+
+```sh
+cd ~/FitCoach
+python3 -m venv .env
+source .env/bin/activate
+pip install -r requirements.txt
+```
+
+### 4.4 Confirm API Key File
+
+Make sure `.hevy_env` exists in the same folder:
+```sh
+cat .hevy_env
+# Should output: HEVY_API_KEY=<YOUR_HEVY_API_KEY>
+```
+
+### 4.5 Quick Sanity Curl Test
+
+Run the proxy (in your venv):
+```sh
+uvicorn hevy_proxy:app --reload --port 8000
+```
+*In another terminal tab/window:*
+```sh
+curl -i http://127.0.0.1:8000/workouts?page=1&pageSize=1
+# Should return HTTP/1.1 200 OK and JSON listing your workouts.
+```
+
+### 4.6 Create a systemd Service for the Proxy
+
+Create the service file:
+```sh
+sudo nano /etc/systemd/system/hevy-proxy.service
+```
+
+Paste:
+```
+[Unit]
+Description=Hevy Proxy Service
+After=network.target
+
+[Service]
+WorkingDirectory=/home/<YOUR_PI_USER>/FitCoach
+ExecStart=/home/<YOUR_PI_USER>/FitCoach/.env/bin/uvicorn hevy_proxy:app --port 8000
+EnvironmentFile=/home/<YOUR_PI_USER>/FitCoach/.hevy_env
+Restart=always
+User=<YOUR_PI_USER>
+
+[Install]
+WantedBy=multi-user.target
+```
+*(Replace `<YOUR_PI_USER>` with your actual user, e.g. Haakiiz)*  
+Save & exit (Ctrl+X, Y, Enter).
+
+Enable and start:
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable hevy-proxy
+sudo systemctl start hevy-proxy
+sudo systemctl status hevy-proxy  # Should be "active (running)"
+```
+
+### 4.7 Install ngrok, Add Authtoken, and Start as a systemd Service
+
+**Install ngrok:**
+```sh
+curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+sudo apt update && sudo apt install -y ngrok
+```
+
+**Add your ngrok authtoken:**
+```sh
+ngrok config add-authtoken <YOUR_NGROK_TOKEN>
+```
+
+**Test/start the tunnel manually at first:**  
+```sh
+ngrok http --domain=<YOUR_NGROK_DOMAIN>.ngrok-free.app 8000
+```
+*Example:*  
+`ngrok http --domain=<YOUR_NGROK_DOMAIN>.ngrok-free.app 8000`
+
+**Automate ngrok tunnel with systemd:**  
+(If manual launch works, do the following for auto-start.)
+
+Create service file:
+```sh
+sudo nano /etc/systemd/system/ngrok.service
+```
+Paste (adjust ngrok path if needed, e.g. `/usr/local/bin/ngrok`):
+```
+[Unit]
+Description=Ngrok Tunnel for Hevy Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ngrok http --domain=<YOUR_NGROK_DOMAIN>.ngrok-free.app 8000
+User=<YOUR_PI_USER>
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+Save & exit.
+
+Start and enable:
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now ngrok
+sudo systemctl status ngrok
+```
+
+#### **Command to view forwarding URL and logs**
+```sh
+journalctl -u ngrok -f
+```
+Look for lines like:
+```
+Forwarding  https://<YOUR_NGROK_DOMAIN>.ngrok-free.app -> http://localhost:8000
+```
+
+---
+
+## 5. Wire into Custom GPT
+
+### Minimal OpenAPI snippet (`hevy_proxy.yaml`)
+```yaml
+openapi: 3.1.0
+info:
+  title: Hevy Proxy
+  version: "0.1"
+servers:
+  - url: https://<YOUR_NGROK_DOMAIN>.ngrok-free.app
+paths:
+  /workouts:
+    get:
+      operationId: get_recent_workouts
+      summary: Get recent workouts
+      parameters:
+        - in: query
+          name: page
+          schema: {type: integer, default: 1}
+        - in: query
+          name: pageSize
+          schema: {type: integer, default: 10}
+        - in: query
+          name: since
+          schema: {type: string, format: date-time}
+      responses:
+        "200":
+          description: list of workouts
+          content:
+            application/json:
+              schema: {type: object}
+```
+- Replace the `servers:` URL exactly as shown by `journalctl -u ngrok -f`.
+
+**In the ChatGPT Actions UI:**  
+- Import this spec (from file or URL).
+- Set **Authentication = None**.
+
+---
+
+## 6. Verification
+
+Test end-to-end by:
+- Opening a new chat with your GPT.
+- Ask: **“What did I train this week?”**
+- Your GPT should reply based on actual data from HEVY (not a hallucinated list).
+- For extra confirmation, run:
+  ```sh
+  curl "https://<YOUR_NGROK_DOMAIN>.ngrok-free.app/workouts?page=1&pageSize=1"
+  ```
+  and compare the response to your GPT’s answer.
+
+---
+
+## 7. Common Pitfalls & Fixes
+
+| Symptom | Likely Cause | How to Fix |
+|---------|--------------|------------|
+| **InvalidApiKey, 401** | API key unset or typo | Double-check .hevy_env, or use `export HEVY_API_KEY=...`, then `sudo systemctl restart hevy-proxy` |
+| **HTTP 400 pageSize must be ≤10** | pageSize over 10 | Clamp to 10 in your proxy, or use a smaller value when querying |
+| **Proxy returns 500 Internal Server Error** | Crash in proxy code (typos, env missing) | Check logs with `sudo journalctl -u hevy-proxy -f` on the Pi |
+| **Proxy not responding** | Systemd not running, or port 8000 blocked | `sudo systemctl status hevy-proxy`, check firewall, etc. |
+| **ngrok URL stops working after logout/reboot** | ngrok not running as systemd | Create the `ngrok.service` (see above) and enable it |
+| **GPT won't accept “http://” or local IP** | OpenAI requires HTTPS public addresses | Always use ngrok’s HTTPS URL in the OpenAPI spec |
+| **No workouts returned** | Time filter too strict, or no logged workouts | Test with no `since` parameter, adjust the date window |
+
+---
+
+**You’re done! Once everything is running, both the Pi proxy and ngrok tunnel stay up automatically—even after you reboot or close all terminals. Your fitcoach GPT will always see your real HEVY workouts, securely and reliably.**
