@@ -1,6 +1,9 @@
 openapi: 3.1.0
-info: {title: Hevy Proxy, version: '0.1'}
-servers: [{url: https://<YOUR_NGROK_DOMAIN>.ngrok-free.app}]
+info:
+  title: Hevy Proxy
+  version: "0.1"
+servers:
+  - url: {YOUR URL}
 paths:
   /workouts:
     get:
@@ -9,16 +12,23 @@ paths:
       parameters:
         - in: query
           name: page
-          schema: {type: integer, default: 1}
+          schema:
+            type: integer
+            default: 1
         - in: query
           name: pageSize
-          schema: {type: integer, default: 25}
+          schema:
+            type: integer
+            default: 25
         - in: query
           name: since
-          schema: {type: string, format: date-time}
+          schema:
+            type: string
+            format: date-time
       responses:
-        '200':
+        "200":
           description: list of workouts
           content:
             application/json:
-              schema: {type: object}
+              schema:
+                type: object
