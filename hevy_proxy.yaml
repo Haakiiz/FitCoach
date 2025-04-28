@@ -1,0 +1,24 @@
+openapi: 3.1.0
+info: {title: Hevy Proxy, version: '0.1'}
+servers: [{url: https://<YOUR_NGROK_DOMAIN>.ngrok-free.app}]
+paths:
+  /workouts:
+    get:
+      operationId: get_recent_workouts
+      summary: Get recent workouts
+      parameters:
+        - in: query
+          name: page
+          schema: {type: integer, default: 1}
+        - in: query
+          name: pageSize
+          schema: {type: integer, default: 25}
+        - in: query
+          name: since
+          schema: {type: string, format: date-time}
+      responses:
+        '200':
+          description: list of workouts
+          content:
+            application/json:
+              schema: {type: object}
