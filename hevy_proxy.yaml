@@ -3,32 +3,129 @@ info:
   title: Hevy Proxy
   version: "0.1"
 servers:
-  - url: {YOUR URL}
+  - url: https://prawn-trusting-burro.ngrok-free.app
 paths:
   /workouts:
     get:
-      operationId: get_recent_workouts
-      summary: Get recent workouts
+      operationId: getRecentWorkouts
+      summary: Retrieve past workouts
       parameters:
         - in: query
           name: page
+          required: false
           schema:
             type: integer
-            default: 1
         - in: query
           name: pageSize
+          required: false
           schema:
             type: integer
-            default: 25
-        - in: query
-          name: since
-          schema:
-            type: string
-            format: date-time
       responses:
         "200":
-          description: list of workouts
+          description: Successfully retrieved workouts
           content:
             application/json:
               schema:
                 type: object
+    post:
+      operationId: logWorkout
+      summary: Create a workout in Hevy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LogWorkoutBody"
+      responses:
+        "201":
+          description: Workout successfully created
+          content:
+            application/json:
+              schema:
+                type: object
+  /exercise_templates/all:
+    get:
+      operationId: allTemplates
+      summary: Return every cached exercise template title and ID
+      responses:
+        "200":
+          description: Successfully retrieved templates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  templates:
+                    type: object
+                    additionalProperties:
+                      type: string
+components:
+  schemas:
+    LogWorkoutBody:
+      type: object
+      required:
+        - workout
+      properties:
+        workout:
+          $ref: "#/components/schemas/WorkoutCreate"
+    WorkoutCreate:
+      type: object
+      required:
+        - title
+        - start_time
+        - end_time
+        - is_private
+        - exercises
+      properties:
+        title:
+          type: string
+        start_time:
+          type: string
+          format: date-time
+        end_time:
+          type: string
+          format: date-time
+        is_private:
+          type: boolean
+        exercises:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExerciseInput"
+    ExerciseInput:
+      type: object
+      required:
+        - title
+        - sets
+      properties:
+        title:
+          type: string
+        notes:
+          type: string
+        sets:
+          type: array
+          items:
+            $ref: "#/components/schemas/SetInput"
+    SetInput:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum:
+            - normal
+            - warmup
+            - dropset
+            - failure
+        weight_kg:
+          type: number
+        reps:
+          type: integer
+        distance_meters:
+          type: number
+        duration_seconds:
+          type: number
+        rpe:
+          type: number
+        custom_metric:
+          type: number
