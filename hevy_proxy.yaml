@@ -3,7 +3,7 @@ info:
   title: Hevy Proxy
   version: "0.1"
 servers:
-  - url: https://prawn-trusting-burro.ngrok-free.app
+  - url: [NGROK TUNNEL]
 paths:
   /workouts:
     get:

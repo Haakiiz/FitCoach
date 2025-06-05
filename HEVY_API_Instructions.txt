@@ -195,7 +195,7 @@ ngrok config add-authtoken <YOUR_NGROK_TOKEN>
 ngrok http --domain=<YOUR_NGROK_DOMAIN>.ngrok-free.app 8000
 ```
 *Example:*  
-`ngrok http --domain=prawn-trusting-burro.ngrok-free.app 8000`
+[NO SECRET EXAMPLE FOR YOU]
 
 **Automate ngrok tunnel with systemd:**  
 (If manual launch works, do the following for auto-start.)
