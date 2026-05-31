@@ -274,9 +274,18 @@ paths:
 ```
 - Replace the `servers:` URL exactly as shown by `journalctl -u ngrok -f`.
 
-**In the ChatGPT Actions UI:**  
+**In the ChatGPT Actions UI:**
 - Import this spec (from file or URL).
 - Set **Authentication = None**.
+
+> ⚠️ **Security recommendation:** With `Authentication = None`, anyone who learns the
+> ngrok URL can read AND write your Hevy workouts. Before exposing the tunnel:
+> 1. Add a shared secret to `hevy_proxy.py` — require an `Authorization: Bearer <token>`
+>    (or `X-API-Key`) header on every endpoint and reject requests that don't match a
+>    token stored in `.hevy_env`. Then set ChatGPT Actions Authentication to **API Key**
+>    with that same token.
+> 2. Rotate the ngrok subdomain (the previous one was exposed) and keep the new domain
+>    out of any committed file — use the `<YOUR_NGROK_DOMAIN>` placeholder.
 
 ---
 

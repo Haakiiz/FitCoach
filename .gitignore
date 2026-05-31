@@ -1,0 +1,15 @@
+# Secrets / env
+.env
+.env.*
+.hevy_env
+
+# IDE / tooling
+.idea/
+.claude/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
