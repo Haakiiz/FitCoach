@@ -5,18 +5,24 @@ import asyncio
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, status
 import httpx
+from dashboard.demo_data import demo_scenario
+from dashboard.routes import install as install_dashboard
 
 # ─── Load environment ───
 load_dotenv(dotenv_path=".hevy_env")
 
+# Demo mode (FITCOACH_DEMO=1): the dashboard shows made-up data and needs no API key
+DEMO_MODE = demo_scenario() is not None
+
 HEVY_API_KEY = os.getenv("HEVY_API_KEY")
-if not HEVY_API_KEY:
+if not HEVY_API_KEY and not DEMO_MODE:
     raise RuntimeError("Missing HEVY_API_KEY; check your .hevy_env file")
 
 HEVY_API_URL = "https://api.hevyapp.com/v1"
 
 # ─── Setup FastAPI ───
 app = FastAPI()
+install_dashboard(app)  # adds /dashboard (hidden from the GPT's OpenAPI schema)
 
 # ─── Template Caching ───
 TEMPLATE_CACHE_PATH = Path(__file__).with_name("exercise_cache.json")
@@ -52,6 +58,9 @@ async def refresh_templates():
 
 @app.on_event("startup")
 async def startup_event():
+    if DEMO_MODE:
+        print("[templates] demo mode: skipping template refresh.")
+        return
     await refresh_templates()
 
     async def _ticker():
