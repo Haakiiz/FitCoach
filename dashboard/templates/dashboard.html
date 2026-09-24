@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="nb">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#FAF7F2">
+  <title>FitCoach – dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23FF6B4A'/%3E%3Cpath d='M7 17h4l2.5-6 5 11 2.5-5H25' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/dashboard/static/dashboard.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Hopp til innholdet</a>
+
+  <header class="topbar" role="banner">
+    <div class="topbar__inner">
+      <div class="brand">
+        <span class="brand__mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="32" height="32"><rect width="32" height="32" rx="10" fill="currentColor"/><path d="M7 17h4l2.5-6 5 11 2.5-5H25" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="brand__name">FitCoach</span>
+        <span class="chip chip--demo" id="demo-badge" hidden>Demodata</span>
+      </div>
+      <div class="topbar__actions">
+        <span class="topbar__updated" id="updated-at" aria-live="polite"></span>
+        <button type="button" class="btn btn--ghost" id="refresh-btn">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 3v5h5"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 21v-5h-5"/></svg>
+          <span>Oppdater</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="page" tabindex="-1">
+    <noscript>
+      <div class="card noscript">Dashboardet trenger JavaScript for å vise tallene dine.</div>
+    </noscript>
+
+    <section class="hero" id="hero" aria-labelledby="hero-title"></section>
+
+    <div class="bento" id="bento">
+      <section class="card card--rec span-2" id="card-rec" aria-labelledby="rec-title"></section>
+      <section class="card span-2" id="card-weight" aria-labelledby="weight-title"></section>
+      <section class="card span-2" id="card-recovery" aria-labelledby="recovery-title"></section>
+      <section class="card span-2" id="card-activity" aria-labelledby="activity-title"></section>
+      <section class="card span-3" id="card-consistency" aria-labelledby="consistency-title"></section>
+      <section class="card span-1" id="card-balance" aria-labelledby="balance-title"></section>
+      <section class="card span-4" id="card-strength" aria-labelledby="strength-title"></section>
+      <section class="card span-2" id="card-volume" aria-labelledby="volume-title"></section>
+      <section class="card span-1" id="card-neglected" aria-labelledby="neglected-title"></section>
+      <section class="card span-1" id="card-prs" aria-labelledby="prs-title"></section>
+      <section class="card span-2" id="card-progression" aria-labelledby="progression-title"></section>
+      <section class="card card--quote span-2" id="card-quote" aria-label="Dagens sitat"></section>
+    </div>
+
+    <footer class="footer" id="footer" role="contentinfo"></footer>
+  </main>
+
+  <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script id="fitcoach-data" type="application/json">{{ data_json|safe }}</script>
+  <script src="/dashboard/static/dashboard.js" defer></script>
+</body>
+</html>
