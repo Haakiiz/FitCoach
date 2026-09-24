@@ -1,0 +1,22 @@
+# ─── Secrets: NEVER commit these ───
+.hevy_env
+.env
+*.env
+.garminconnect/
+garmin_tokens/
+
+# ─── Local data created by the proxy/dashboard ───
+exercise_cache.json
+exercise_muscles_cache.json
+weights.json
+
+# ─── Python ───
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# ─── Local working files (design critique loop) ───
+.kritikk/
+TASKS.md
