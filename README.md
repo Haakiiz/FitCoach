@@ -12,6 +12,7 @@ A detailed, step‑by‑step setup guide is provided in **HEVY_API_Instructions.
   - `GET /exercise_templates/all` – return cached exercise template IDs.
 - The same server also hosts a personal **dashboard** (see [Dashboard](#dashboard) below). These routes are hidden from `/openapi.json`, so the Custom GPT never sees them:
   - `GET /dashboard` – the dashboard web page.
+  - `GET /dashboard/login`, `POST /dashboard/login` – a small login form (used when `DASHBOARD_TOKEN` is set).
   - `GET /dashboard/api` – the dashboard data as JSON (`?refresh=1` fetches fresh data instead of using the cache).
   - `POST /dashboard/weight` – save a weigh-in, e.g. `{"kg": 96.4, "date": "2026-09-24"}` (date is optional).
 - The server expects your API key in a local `.hevy_env` file:
@@ -29,6 +30,7 @@ A detailed, step‑by‑step setup guide is provided in **HEVY_API_Instructions.
    source .env/bin/activate
    pip install -r requirements.txt
    ```
+   After every `git pull`, run `pip install -r requirements.txt` again: new features (like the dashboard) can need new packages. If a dashboard package is missing, the proxy still starts and the GPT endpoints keep working, but it prints `[dashboard] DISABLED …` and `/dashboard` is not available.
 3. **Add your HEVY API key** to a `.hevy_env` file in the project directory as shown above.
 4. **Start the proxy**:
    ```sh
@@ -46,22 +48,42 @@ The proxy also serves a live dashboard with your training, recovery and weight. 
 
 Start the proxy as usual (`uvicorn hevy_proxy:app --port 8000`) and open:
 
-- on the Pi itself: <http://localhost:8000/dashboard>
-- from your phone: `https://<your-ngrok-address>/dashboard?key=<DASHBOARD_TOKEN>`
+- on the Pi itself or another device on your home network: <http://localhost:8000/dashboard> (or the Pi's local IP, e.g. `http://192.168.1.20:8000/dashboard`)
+- from anywhere (your phone on 4G): `https://<your-ngrok-address>/dashboard`. This needs `DASHBOARD_TOKEN`, see below.
 
 The page caches data, so reloading is cheap: HEVY workouts are kept for 10 minutes and Garmin data for 30 minutes. The **Oppdater** button fetches fresh data.
 
-### Protect it with DASHBOARD_TOKEN (strongly recommended)
+### Who can see the dashboard?
 
-Your ngrok address is public, so **anyone who knows it can see your dashboard** unless you set a token. Add a long random value to `.hevy_env`:
+Your ngrok address is public, so the dashboard is locked down by default:
 
+| | Without `DASHBOARD_TOKEN` | With `DASHBOARD_TOKEN` |
+|---|---|---|
+| On the Pi / home network (direct) | Open | Log in once |
+| Through ngrok (internet) | Refused (the page explains how to set a token) | Log in once |
+| Demo mode (`FITCOACH_DEMO`) | Open (only made-up data) | Log in once |
+
+"Direct" means the request comes from `127.0.0.1`, `::1` or a private home network (`10.x`, `172.16–31.x`, `192.168.x`) **and** has no `X-Forwarded-For`, `X-Forwarded-Host` or `Forwarded` header. ngrok always adds those headers, so requests through ngrok never count as local.
+
+### Set DASHBOARD_TOKEN (strongly recommended)
+
+1. Make a long random key:
+   ```sh
+   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+   ```
+2. Add it to `.hevy_env` and restart the proxy:
+   ```
+   DASHBOARD_TOKEN=<the long random key>
+   ```
+3. Open `/dashboard`. You are sent to a small login page (`/dashboard/login`). Paste the key and press **Logg inn**. The browser gets a login cookie that lasts 90 days.
+
+The key is sent in the form (the request body), never in the address. That keeps it out of uvicorn's log, the ngrok inspector and your browser history. (Old links like `/dashboard?key=…` no longer log you in, and any `key=` in the access log is shown as `key=***`.)
+
+For scripts or `curl`, send the key as a header instead:
+
+```sh
+curl -H "Authorization: Bearer <your key>" https://<your-ngrok-address>/dashboard/api
 ```
-DASHBOARD_TOKEN=<a long random string>
-```
-
-You can make one with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`. Restart the proxy afterwards.
-
-Then open `/dashboard?key=<your token>` once. The browser gets a login cookie (valid for 90 days) and is sent on to `/dashboard`, so the key does not stay in the address bar. Without a valid key or cookie the page answers *401*. If no token is set, the dashboard is open and the proxy prints a warning when it starts.
 
 ### Connect Garmin (optional)
 
@@ -79,9 +101,15 @@ Then open `/dashboard?key=<your token>` once. The browser gets a login cookie (v
 
 Without `GARMIN_EMAIL` and `GARMIN_PASSWORD`, the dashboard simply shows "Garmin er ikke tilkoblet". If HEVY or Garmin cannot be reached, the page still loads and shows a short message about what failed.
 
+To protect your Garmin account, the dashboard is careful:
+
+- If Garmin has not answered within 25 seconds, the page loads without Garmin data.
+- After a Garmin error it waits 20 minutes before asking Garmin again (unless you press **Oppdater**).
+- If a login with your e-mail and password fails (wrong password, MFA, "too many requests"), it does **not** try the password again by itself, because repeated attempts can send MFA e-mails or lock the account. The saved tokens are still tried. Press **Oppdater** (`?refresh=1`) or restart the proxy to allow one new password login. If MFA is the problem, run `python -m dashboard.sources` again.
+
 ### Weigh-ins
 
-Use the weight form on the dashboard. Weigh-ins are stored in `weights.json` next to `hevy_proxy.py` (or the path in `WEIGHTS_PATH`). The weight must be between 30 and 250 kg and the date cannot be in the future. A new weigh-in on the same date replaces the old one. `weights.json` is personal, so it is listed in `.gitignore`.
+Use the weight form on the dashboard. Weigh-ins are stored in `weights.json` next to `hevy_proxy.py` (or the path in `WEIGHTS_PATH`). The weight must be between 30 and 250 kg, and the date must be in the year 2000 or later and not in the future. A new weigh-in on the same date replaces the old one. `weights.json` is personal, so it is listed in `.gitignore`.
 
 ### Demo mode (made-up data)
 
@@ -97,7 +125,7 @@ Then open <http://localhost:8000/dashboard>. All data is synthetic. `FITCOACH_DE
 
 | Variable | Default | What it does |
 |---|---|---|
-| `DASHBOARD_TOKEN` | *(none)* | Access key for the dashboard (see above) |
+| `DASHBOARD_TOKEN` | *(none)* | Access key for the dashboard. Without it, only direct local requests get in (see above) |
 | `DASHBOARD_NAME` | *(empty)* | Your name in the greeting, e.g. `Håkon` |
 | `DASHBOARD_TZ` | `Europe/Oslo` | Time zone used for "today" and the greeting |
 | `WEIGHTS_PATH` | `weights.json` | Where weigh-ins are stored |

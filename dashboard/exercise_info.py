@@ -10,6 +10,8 @@ a dumbbell that is not on the rack:
 - Dumbbells: 1–10 kg (1 kg steps), 16, 22 and 24 kg.
 - Z-bar / barbell with plates: 2.5 kg steps.
 - A self-imposed ceiling of 90 kg on Romanian Deadlift (Barbell).
+- Machines, cables and bands (e.g. in a hotel gym) are not on the rack: they simply
+  move in 2.5 kg steps.
 
 Only the standard library is used, and every function is safe to call with odd input
 (unknown titles, None, empty strings).
