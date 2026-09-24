@@ -101,7 +101,7 @@
     pulse: '<path d="M3 12h4l2.5-6 5 12 2.5-6H21"/>',
     flame: '<path d="M12 21.5c3.9 0 7-2.6 7-6.6 0-4.1-3.1-6.2-4.3-9.9-.3-.9-1.5-1.1-2-.3-1.2 2.1-2.4 2.9-3.6 2.4-.6-.3-1.4.1-1.5.8-.4 1.9-2.6 3.3-2.6 7 0 4 3.1 6.6 7 6.6z"/><path d="M12 18.5a2.6 2.6 0 0 1-2.6-2.6c0-1.8 1.6-2.4 2.3-4 1 1.1 2.9 2.2 2.9 4a2.6 2.6 0 0 1-2.6 2.6z"/>',
     calendar: '<rect x="3.5" y="5" width="17" height="15.5" rx="3.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/>',
-    dumbbell: '<path d="M6.5 7v10M17.5 7v10M3.5 9.5v5M20.5 9.5v5M6.5 12h11"/>',
+    dumbbell: '<rect x="5" y="6.5" width="3.5" height="11" rx="1.3"/><rect x="15.5" y="6.5" width="3.5" height="11" rx="1.3"/><path d="M2.8 9.5v5M21.2 9.5v5M8.5 12h7"/>',
     moon: '<path d="M19.5 14.6A7.8 7.8 0 0 1 9.4 4.5a7.8 7.8 0 1 0 10.1 10.1z"/>',
     battery: '<rect x="3" y="7" width="15.5" height="10" rx="3"/><path d="M21 10.5v3M6.5 10v4M10 10v4"/>',
     heart: '<path d="M19.6 5.6a4.9 4.9 0 0 0-7 0L12 6.3l-.6-.7a4.9 4.9 0 0 0-7 7L12 20.2l7.6-7.6a4.9 4.9 0 0 0 0-7z"/>',
@@ -442,10 +442,22 @@
       '<div class="weigh__row">' +
       '<label class="field field--kg"><span class="field__lbl">Ny veiing</span><span class="field__box"><input id="weigh-kg" name="kg" type="text" inputmode="decimal" autocomplete="off" placeholder="' +
       (has(w.current_kg) ? num(w.current_kg, 1) : '98,0') + '" aria-describedby="weigh-msg" required><span class="field__suffix">kg</span></span></label>' +
-      '<label class="field field--date"><span class="field__lbl">Dato</span><span class="field__box"><input id="weigh-date" name="date" type="date" value="' + esc(DATA.today) + '" max="' + esc(DATA.today) + '"></span></label>' +
+      '<label class="field field--date"><span class="field__lbl">Dato</span><span class="field__box field__box--select"><select id="weigh-date" name="date">' + dateOptions() + '</select>' + icon('arrowDown', 'icon icon--xs field__chev') + '</span></label>' +
       '<button type="submit" class="btn btn--primary weigh__btn">' + icon('plus', 'icon icon--sm') + '<span>Lagre veiing</span></button>' +
       '</div><p class="weigh__msg" id="weigh-msg" role="status" aria-live="polite"></p></form>';
     el.innerHTML = html;
+  }
+
+  function isoDate(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+  function dateOptions() {
+    var t = parseDate(DATA.today) || new Date();
+    var out = '';
+    for (var i = 0; i < 7; i++) {
+      var d = new Date(t.getFullYear(), t.getMonth(), t.getDate() - i);
+      var lbl = i === 0 ? 'I dag, ' + fmtDate(isoDate(d)) : i === 1 ? 'I går, ' + fmtDate(isoDate(d)) : cap(WD_SHORT[d.getDay()]) + ' ' + fmtDate(isoDate(d));
+      out += '<option value="' + isoDate(d) + '"' + (i === 0 ? ' selected' : '') + '>' + esc(lbl) + '</option>';
+    }
+    return out;
   }
 
   function drawWeight(el, W) {
@@ -544,9 +556,9 @@
     }
     var rd = numv(r.readiness);
     var ringHtml = '<div class="rring">' + (rd !== null
-      ? ring({ pct: rd, size: 148, stroke: 13, color: 'var(--teal)', track: 'var(--teal-100)', label: 'Readiness ' + num(rd) + ' av 100' }) +
+      ? ring({ pct: rd, size: 132, stroke: 12, color: 'var(--teal)', track: 'var(--teal-100)', label: 'Readiness ' + num(rd) + ' av 100' }) +
         '<div class="rring__center"><span class="rring__v">' + num(rd) + '</span><span class="rring__lbl">readiness</span></div>'
-      : ring({ pct: 0, size: 148, stroke: 13, color: 'var(--teal)', track: 'var(--teal-100)', label: 'Readiness mangler' }) +
+      : ring({ pct: 0, size: 132, stroke: 12, color: 'var(--teal)', track: 'var(--teal-100)', label: 'Readiness mangler' }) +
         '<div class="rring__center"><span class="rring__lbl">Ingen readiness i dag</span></div>') +
       '</div>';
     var lbl = has(r.readiness_label) ? '<span class="chip chip--teal">' + esc(r.readiness_label) + '</span>' : '';
@@ -571,8 +583,8 @@
     if (has(r.body_battery_peak)) {
       var lo = numv(r.body_battery_low), pk = numv(r.body_battery_peak);
       bb = '<div class="rmetric"><div class="rmetric__head">' + icon('battery', 'icon icon--sm') + '<span>Body battery</span></div>' +
-        '<div class="rmetric__v">' + num(pk) + '<small>' + (lo !== null ? ' / lavest ' + num(lo) : ' topp') + '</small></div>' +
-        '<div class="range" role="img" aria-label="' + esc('Body battery fra ' + (lo !== null ? num(lo) : '0') + ' til ' + num(pk)) + '"><span style="left:' + clamp(lo || 0, 0, 100) + '%;width:' + clamp(pk - (lo || 0), 2, 100) + '%"></span></div></div>';
+        '<div class="rmetric__v">' + num(pk) + '<small> topp</small></div>' +
+        '<div class="range" role="img" aria-label="' + esc('Body battery fra ' + (lo !== null ? num(lo) : '0') + ' til ' + num(pk)) + '"><span style="left:' + clamp(lo || 0, 0, 100) + '%;width:' + clamp(pk - (lo || 0), 2, 100) + '%"></span></div>' + (lo !== null ? '<span class="rmetric__sub">Lavest ' + num(lo) + '</span>' : '') + '</div>';
     }
     var small = function (ic, label, v, unit) {
       return has(v) ? '<div class="rmetric"><div class="rmetric__head">' + icon(ic, 'icon icon--sm') + '<span>' + label + '</span></div><div class="rmetric__v">' + num(v) + '<small> ' + unit + '</small></div></div>' : '';
@@ -648,7 +660,7 @@
         miniKpi('Snitt 7 dager', has(a.steps_avg_7d) ? num(a.steps_avg_7d) : null, 'steg') +
         miniKpi('Kalorier', has(a.calories_avg_7d) ? num(a.calories_avg_7d) : null, 'kcal/dag') + '</div>';
       var hasSteps = arr(a.steps_7d).some(function (d) { return d && numv(d.steps) !== null; });
-      html += hasSteps ? '<div class="chart chart--steps" data-chart="steps"></div>' : '<p class="note">' + icon('info', 'icon icon--xs') + 'Ingen skrittdata de siste 7 dagene.</p>';
+      html += hasSteps ? '<div class="chart chart--steps" data-chart="steps"></div>' + (has(a.steps_avg_7d) ? '<p class="chart-key"><i class="dashkey"></i>Stiplet linje: snitt siste 7 dager (' + num(a.steps_avg_7d) + ' steg)</p>' : '') : '<p class="note">' + icon('info', 'icon icon--xs') + 'Ingen skrittdata de siste 7 dagene.</p>';
     } else {
       html += '<div class="inline-empty">' + '<span class="inline-empty__icon">' + icon('watch') + '</span>' +
         '<div><strong>Steg og kalorier kommer fra Garmin</strong><span>Koble til Garmin for daglige skritt, kaloriforbruk og løpeturer fra klokka. Se Restitusjon for oppsett.</span></div></div>';
@@ -704,14 +716,11 @@
         s += '<path d="' + barPath(bx, y0, bw, H - padB - y0, 4) + '" class="' + (isToday || i === n - 1 ? 'bar-teal' : 'bar-teal-soft') + '" data-tip="' + tip + '"/>';
         s += '<rect x="' + (i * slot) + '" y="' + padT + '" width="' + slot + '" height="' + (H - padT - padB) + '" fill="transparent" data-tip="' + tip + '"/>';
         if (i === n - 1 || v === Math.max.apply(null, ok)) {
-          s += '<text class="val-sm" x="' + (bx + bw / 2) + '" y="' + (y0 - 6) + '" text-anchor="middle">' + (v >= 10000 ? numS(v / 1000) + 'k' : num(v)) + '</text>';
+          s += '<text class="val-sm" x="' + (bx + bw / 2) + '" y="' + (y0 - 6) + '" text-anchor="middle">' + num(v) + '</text>';
         }
       }
       s += '<text class="axis' + (isToday ? ' axis--strong' : '') + '" x="' + (bx + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle">' + (isToday ? 'i dag' : WD_SHORT[dd.getDay()]) + '</text>';
     });
-    if (avg !== null) {
-      s += '<text class="axis avg-lbl" x="' + (W - 2) + '" y="' + (yy(avg) - 5).toFixed(1) + '" text-anchor="end">snitt ' + num(avg) + '</text>';
-    }
     el.innerHTML = s + '</svg>';
   }
 
