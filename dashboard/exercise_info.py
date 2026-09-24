@@ -179,6 +179,8 @@ DUMBBELLS_KG = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 22, 24]
 BARBELL_STEP_KG = 2.5
 BARBELL_MIN_KG = 10.0      # an empty Z-bar weighs roughly 10 kg
 WEIGHT_CAPS_KG = {"Romanian Deadlift (Barbell)": 90.0}   # the user's own "ikke mer enn 90 kg"
+# Words that mean "machine, cable or band" – loads that are not on the home rack.
+_MACHINE_WORDS = ["(machine)", "(cable)", "(smith machine)", "(band)", "machine", "cable", "smith"]
 
 
 def _clean(title):
@@ -276,9 +278,6 @@ def equipment_kind(title):
     if "barbell" in lower or "ez bar" in lower or "z bar" in lower or "z-bar" in lower:
         return "barbell"
     return "bodyweight"
-
-
-_MACHINE_WORDS = ["(machine)", "(cable)", "(smith machine)", "(band)", "machine", "cable", "smith"]
 
 
 def to_number(value):
