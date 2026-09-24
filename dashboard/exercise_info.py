@@ -401,13 +401,14 @@ def next_weight_down(title, kg):
     return candidate if candidate >= minimum else None
 
 
-def deload_weight(title, kg, factor, floor_pct=0.55):
-    """A lighter restart weight after a break: the heaviest existing weight <= kg × factor.
+def deload_weight(title, kg, factor, floor_pct=0.55, ceiling_pct=0.8):
+    """A lighter restart weight after a break, using only weights that exist.
 
-    With a gappy dumbbell rack the exact percentage is rarely available, so we accept
-    anything down to `floor_pct` (55 %). If nothing fits in that window we take the
-    heaviest weight at or below 80 %, and as a last resort one step down.
-    Example: 22 kg × 0.7 = 15.4 -> 16 kg is allowed (small tolerance), 16 kg × 0.7 -> 10 kg.
+    We aim for kg × factor (e.g. 70 %), but a gappy dumbbell rack rarely has that exact
+    weight. So we pick the existing weight closest to the target within 55–80 % of the
+    old weight (ties go to the lighter one). Only if nothing fits that window do we take
+    the heaviest weight at or below 80 %, and as a last resort one step down.
+    Examples at 70 %: 22 kg -> 16 kg (73 %), 16 kg -> 10 kg (62 %), 8 kg -> 6 kg (75 %).
     """
     kg, factor = to_number(kg), to_number(factor)
     kind = load_kind(title)
@@ -415,20 +416,19 @@ def deload_weight(title, kg, factor, floor_pct=0.55):
         return None
     if kind == "dumbbell":
         options = [float(d) for d in DUMBBELLS_KG]
-        limit = kg * factor * 1.05                       # 5 % tolerance for the rack gaps
     else:
         minimum = BARBELL_MIN_KG if kind == "barbell" else BARBELL_STEP_KG
         options = [minimum + i * BARBELL_STEP_KG for i in range(int((kg - minimum) / BARBELL_STEP_KG) + 1)]
-        limit = kg * factor
     cap = weight_cap(title)
     if cap is not None:
         options = [o for o in options if o <= cap]
-    in_window = [o for o in options if kg * floor_pct - 1e-9 <= o <= limit + 1e-9]
+    target = kg * factor
+    in_window = [o for o in options if kg * floor_pct - 1e-9 <= o <= kg * ceiling_pct + 1e-9]
     if in_window:
-        return max(in_window)
-    below_80 = [o for o in options if o <= kg * 0.8 + 1e-9]
-    if below_80:
-        return max(below_80)
+        return min(in_window, key=lambda o: (abs(o - target), o))
+    below = [o for o in options if o <= kg * ceiling_pct + 1e-9]
+    if below:
+        return max(below)
     return next_weight_down(title, kg) or kg
 
 

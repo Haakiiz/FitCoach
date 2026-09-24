@@ -67,10 +67,6 @@ QUOTES = [
     # Seneca – Brev til Lucilius 1
     {"text": "Mens vi utsetter, raser livet forbi.",
      "author": "Seneca"},
-    # David Goggins – Can't Hurt Me
-    {"text": "Du står i fare for å leve et liv så komfortabelt og mykt at du dør uten "
-             "noen gang å ha oppdaget ditt sanne potensial.",
-     "author": "David Goggins"},
     # Epiktet – Håndbok (Encheiridion) 5
     {"text": "Det er ikke tingene i seg selv som uroer oss, men våre meninger om dem.",
      "author": "Epiktet"},
@@ -82,8 +78,7 @@ QUOTES = [
              "med seg i graven.",
      "author": "Tim Ferriss"},
     # Marcus Aurelius – Meditasjoner 7.67
-    {"text": "Det skal svært lite til for å leve et lykkelig liv. Alt ligger i deg selv, "
-             "i din måte å tenke på.",
+    {"text": "Det skal svært lite til for å leve et lykkelig liv.",
      "author": "Marcus Aurelius"},
     # Seneca – Brev til Lucilius 71
     {"text": "Når en mann ikke vet hvilken havn han styrer mot, er ingen vind gunstig.",

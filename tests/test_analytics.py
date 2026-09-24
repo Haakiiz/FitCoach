@@ -231,7 +231,7 @@ def test_deload_after_99_day_break():
     rdl = [p for p in out["progression"] if p["exercise"] == "Romanian Deadlift (Barbell)"][0]
     assert rdl["next"].endswith("@ 55 kg")                    # 80 kg × 0.7 = 56 -> 55 kg
     rec = out["recommendation"]
-    assert rec["kind"] == "strength" and "Comeback" in rec["title"]
+    assert rec["kind"] == "strength" and rec["title"].startswith("Velkommen tilbake")
     assert "99 dager" in " ".join(rec["why"])
     weights = {e["name"]: e["weight_kg"] for e in rec["exercises"]}
     assert weights["Dumbbell Row"] == 16
@@ -327,11 +327,13 @@ def test_readiness_high_with_good_data():
     assert len(rec["history"]) == 7
 
 
-def test_readiness_ignores_missing_parts():
+def test_readiness_needs_at_least_two_parts():
     day = garmin_day(TODAY, sleep_h=None, bb=None, rhr=None, hrv=None)
     assert an.readiness_score(day, []) is None
     day["sleep_seconds"] = 7.5 * 3600
-    assert an.readiness_score(day, []) == 100
+    assert an.readiness_score(day, []) is None            # one signal alone is too noisy
+    day["body_battery_peak"] = 80
+    assert an.readiness_score(day, []) == round((0.35 * 100 + 0.25 * 80) / 0.6)
 
 
 def test_runs_merge_hevy_and_garmin_without_duplicates():
@@ -358,11 +360,30 @@ def test_weight_trend_eta_and_bmi():
 
 
 def test_weight_progress_is_clamped_and_no_eta_when_gaining():
-    weights = [{"date": (TODAY - timedelta(days=10)).isoformat(), "kg": 103},
-               {"date": TODAY.isoformat(), "kg": 104}]
+    weights = [{"date": (TODAY - timedelta(days=7 * k)).isoformat(), "kg": 104 - 0.3 * k} for k in range(4)]
     w = build([], weights=weights)["weight"]
     assert w["progress_pct"] == 0.0
     assert w["trend_kg_per_week"] > 0 and w["eta_date"] is None
+
+
+def test_no_trend_or_eta_from_two_points():
+    weights = [{"date": "2026-09-20", "kg": 97}, {"date": "2026-09-22", "kg": 95}]
+    w = build([], weights=weights)["weight"]
+    assert w["current_kg"] == 95
+    assert w["trend_kg_per_week"] is None and w["eta_date"] is None
+
+
+def test_eta_uses_trend_capped_at_1_5_kg_per_week():
+    weights = [{"date": (TODAY - timedelta(days=7 * k)).isoformat(), "kg": 96.0 + 3 * k} for k in range(4)]
+    w = build([], weights=weights)["weight"]
+    assert w["trend_kg_per_week"] == pytest.approx(-3.0)
+    assert w["eta_date"] == (TODAY + timedelta(weeks=4)).isoformat()      # 6 kg / 1.5 kg per week
+
+
+def test_stale_weight_is_flagged():
+    w = build([], weights=[{"date": "2026-09-01", "kg": 97}])["weight"]
+    assert w["stale_days"] == 23
+    assert build([], weights=[{"date": "2026-09-20", "kg": 97}])["weight"]["stale_days"] is None
 
 
 # ─── Robustness and contract ───
@@ -374,7 +395,7 @@ SCHEMA_KEYS = {
 }
 NESTED_KEYS = {
     "weight": {"start_kg", "goal_kg", "current_kg", "lost_kg", "progress_pct", "trend_kg_per_week",
-               "eta_date", "bmi", "entries"},
+               "eta_date", "bmi", "stale_days", "entries"},
     "consistency": {"days_since_last", "last_workout_date", "last_workout_title", "streak_weeks",
                     "longest_streak_weeks", "workouts_last_30d", "heatmap"},
     "comeback": {"active", "days_since_last", "title", "message"},
@@ -444,7 +465,7 @@ def test_sources_passthrough_and_demo():
 
 
 @pytest.mark.parametrize("hour,text", [(6, "God morgen"), (12, "God dag"), (20, "God kveld"),
-                                       (23, "God natt"), (3, "God natt")])
+                                       (23, "God kveld"), (3, "God kveld"), (5, "God morgen")])
 def test_greeting(hour, text):
     assert an.greeting(hour) == text
 
@@ -483,3 +504,165 @@ def test_quote_of_day_is_deterministic():
     assert quote_of_day(TODAY) != quote_of_day(TODAY + timedelta(days=1))
     for q in QUOTES:
         assert q["text"] and q["author"]
+
+
+# ─── Round 2: hostile input, equipment, time zones and list-item keys ───
+
+from zoneinfo import ZoneInfo  # noqa: E402
+
+OSLO = ZoneInfo("Europe/Oslo")
+
+
+def test_late_utc_workout_lands_on_next_local_day():
+    w = workout(TODAY, [exercise("Push Up", [wset(None, 10)])])
+    w["start_time"] = "2026-09-23T23:30:00+00:00"            # 01:30 in Oslo on the 24th
+    out = an.build_dashboard([w], {}, None, [], TODAY, datetime(2026, 9, 24, 8, 0, tzinfo=OSLO))
+    assert out["consistency"]["last_workout_date"] == "2026-09-24"
+    # A naive `now` falls back to Europe/Oslo and still gets a time zone in generated_at.
+    out = an.build_dashboard([w], {}, None, [], TODAY, datetime(2026, 9, 24, 8, 0))
+    assert out["consistency"]["last_workout_date"] == "2026-09-24"
+    assert out["generated_at"].endswith("+02:00")
+    out = an.build_dashboard([w], {}, None, [], TODAY, None)
+    assert out["generated_at"].endswith("+02:00")
+
+
+def test_sets_with_missing_values_are_ignored():
+    sets = [wset(22, None), wset(22, 0), wset(None, None), wset(22, 10), wset(22, 10)]
+    p = an.progression_for("Goblet Squat", [(TODAY - timedelta(days=2), sets)], 2)
+    assert p["last"] == "2×10 @ 22 kg"
+    assert p["next"] == "2×12 @ 22 kg"
+
+
+def test_pyramid_plans_at_least_two_sets():
+    p = an.progression_for("Goblet Squat", [(TODAY - timedelta(days=2), [wset(16, 12), wset(22, 6)])], 2)
+    assert p["last"] == "16 kg × 12, 22 kg × 6"
+    assert p["plan_sets"] == 2 and p["next"] == "2×8 @ 22 kg"
+
+
+def test_empty_and_warmup_only_workouts_are_ignored():
+    empty = {"title": "Tom", "start_time": f"{(TODAY - timedelta(days=1)).isoformat()}T10:00:00Z"}
+    warmup_only = workout(TODAY - timedelta(days=1), [exercise("Goblet Squat", [wset(10, 10, "warmup")])])
+    blank = workout(TODAY - timedelta(days=1), [exercise("Goblet Squat", [wset(None, None)])])
+    out = build([strength_workout(date(2026, 6, 17)), empty, warmup_only, blank])
+    assert out["consistency"]["days_since_last"] == 99
+    assert out["comeback"]["active"] is True
+    yesterday = [c for c in out["consistency"]["heatmap"] if c["date"] == (TODAY - timedelta(days=1)).isoformat()]
+    assert yesterday[0]["count"] == 0 and yesterday[0]["kind"] is None
+    assert out["balance"]["last_kind"] == "strength" and out["consistency"]["workouts_last_30d"] == 0
+
+
+def test_string_numbers_do_not_crash():
+    rowing = {"start_time": "2026-09-20T10:00:00Z",
+              "exercises": [{"title": "Rowing", "sets": [{"distance_meters": "5000"}, {"distance_meters": "x"}]}]}
+    out = build([rowing])
+    json.dumps(out, allow_nan=False)
+    assert out["activity"]["running"]["runs"][0]["km"] == 5.0
+    assert ex.is_cardio({"title": "Rowing", "sets": [{"distance_meters": "abc"}]}) is False
+
+
+def test_machine_exercises_are_not_rounded_to_dumbbells():
+    assert ex.equipment_kind("Leg Press (Machine)") == "machine"
+    assert ex.equipment_kind("Lat Pulldown (Cable)") == "machine"
+    assert ex.group("Cable Crossover") == "bryst"
+    assert ex.load_kind("Cable Crossover") == "machine"
+    deload = an.progression_for("Leg Press (Machine)", [(date(2026, 6, 1), [wset(140, 12)] * 3)], 99)
+    assert deload["kind"] == "deload" and deload["next"].endswith("@ 97,5 kg")
+    normal = an.progression_for("Leg Press (Machine)", [(date(2026, 6, 1), [wset(140, 12)] * 3)], None)
+    assert normal["kind"] == "weight" and normal["next"].endswith("@ 147,5 kg")        # +5 %
+    cable = an.progression_for("Cable Crossover", [(date(2026, 6, 1), [wset(30, 12)] * 3)], None)
+    assert cable["kind"] == "weight" and cable["next"].endswith("@ 32,5 kg")             # +2.5 kg
+    assert "manual" not in cable["reason"]
+
+
+def test_off_rack_weight_is_rounded_and_explained():
+    p = an.progression_for("Goblet Squat", [(date(2026, 6, 1), [wset(21, 8)] * 3)], None)
+    assert p["kind"] == "reps" and p["next"] == "3×10 @ 22 kg"
+    assert "21 kg finnes ikke" in p["reason"]
+
+
+def test_rdl_above_cap_is_brought_down_to_90():
+    p = an.progression_for("Romanian Deadlift (Barbell)", [(date(2026, 6, 1), [wset(95, 8)] * 3)], None)
+    assert p["next"] == "3×10 @ 90 kg"
+    assert "over taket" in p["reason"]
+    p = an.progression_for("Romanian Deadlift (Barbell)", [(date(2026, 6, 1), [wset(90, 8)] * 3)], None)
+    assert "90 kg er taket du har satt" in p["reason"]
+    assert "først da øker vi" not in p["reason"]
+    p = an.progression_for("Romanian Deadlift (Barbell)", [(date(2026, 6, 1), [wset(95, 12)] * 3)], None)
+    assert p["kind"] == "sets" and p["next"] == "4×12 @ 90 kg"
+
+
+def test_one_rep_less_is_not_a_hold():
+    p = an.progression_for("Dumbbell Row", [
+        (TODAY - timedelta(days=9), [wset(22, 10)] * 3),
+        (TODAY - timedelta(days=2), [wset(22, 10), wset(22, 10), wset(22, 9)]),
+    ], 2)
+    assert p["kind"] == "reps"
+
+
+def test_deload_picks_heaviest_weight_in_window():
+    def deload(kg, days):
+        return an.progression_for("Dumbbell Row", [(date(2026, 6, 1), [wset(kg, 10)] * 3)], days)
+    assert deload(24, 14)["next"] == "2×12 @ 16 kg"          # not 22 kg (92 %); 67 % -> 2 extra reps
+    assert deload(22, 99)["next"] == "2×10 @ 16 kg"          # 73 %: close enough to 70 %
+    p = deload(16, 99)
+    assert p["next"] == "2×12 @ 10 kg"                       # 62 %: two extra reps compensate
+    assert "To ekstra reps" in p["reason"]
+    for kg in (4, 8, 10, 16, 22, 24):
+        new = float(deload(kg, 99)["next"].split("@ ")[1].split(" ")[0].replace(",", "."))
+        assert 0.55 * kg <= new <= 0.8 * kg
+
+
+def test_comeback_swaps_finisher_for_neglected_shoulders():
+    out = build([strength_workout(date(2026, 6, 17))])       # no shoulder work in the log
+    exercises = out["recommendation"]["exercises"]
+    names = [e["name"] for e in exercises]
+    assert "Shoulder Press (Dumbbell)" in names
+    assert "Single Leg Standing Calf Raise" not in names
+    press = [e for e in exercises if e["name"] == "Shoulder Press (Dumbbell)"][0]
+    assert press["sets"] == 2
+    assert any("skulderpress" in w for w in out["recommendation"]["why"])
+
+
+def test_stale_garmin_is_ignored_by_the_coach():
+    old = garmin_day(TODAY - timedelta(days=14), sleep_h=3, bb=20)
+    out = build([run_workout(TODAY - timedelta(days=1))], garmin=[old])
+    assert out["recovery"]["date"] == (TODAY - timedelta(days=14)).isoformat()
+    assert out["recommendation"]["kind"] == "strength"       # not a recovery day
+    assert not any("Restitusjonsscoren" in w for w in out["recommendation"]["why"])
+
+
+def test_list_items_have_schema_keys():
+    garmin = [garmin_day(TODAY - timedelta(days=i)) for i in range(6, -1, -1)]
+    workouts = [strength_workout(TODAY - timedelta(days=d)) for d in (1, 5, 9, 13)] + \
+               [run_workout(TODAY - timedelta(days=d)) for d in (3, 7)] + \
+               [workout(TODAY - timedelta(days=4), [exercise("Dumbbell Row", [wset(24, 8)] * 4)])]
+    out = build(workouts, garmin=garmin)
+    lift_keys = {"exercise", "label", "muscle_group", "best_e1rm_kg", "current_e1rm_kg", "change_pct",
+                 "last_top_set", "history"}
+    for lift in out["strength"]["lifts"]:
+        assert set(lift) == lift_keys
+        for h in lift["history"]:
+            assert set(h) == {"date", "e1rm_kg"}
+    for pr in out["strength"]["recent_prs"]:
+        assert set(pr) == {"exercise", "label", "date", "value", "e1rm_kg"}
+    assert out["progression"]
+    for p in out["progression"]:
+        assert set(p) == {"exercise", "label", "last", "next", "kind", "reason"}
+    for e in out["recommendation"]["exercises"]:
+        assert set(e) == {"name", "label", "sets", "reps", "weight_kg", "note"}
+    for c in out["consistency"]["heatmap"]:
+        assert set(c) == {"date", "count", "kind"}
+    for n in out["neglected"]:
+        assert set(n) == {"group", "days_since", "message"}
+    for w in out["volume"]["weeks"]:
+        assert set(w) == {"week_start", "total_kg", "by_group"}
+    for r in out["activity"]["running"]["runs"]:
+        assert set(r) == {"date", "km", "minutes", "pace"}
+    for h in out["recovery"]["history"]:
+        assert set(h) == {"date", "sleep_hours", "body_battery_peak", "resting_hr"}
+
+
+def test_no_uncertain_quotes():
+    texts = " ".join(q["text"] for q in QUOTES)
+    assert "komfortabelt og mykt" not in texts
+    assert "i din måte å tenke på" not in texts

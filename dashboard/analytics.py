@@ -1069,19 +1069,19 @@ def _plan_double_progression(title, last):
                          f"(+{int(round(jump_pct))} %) – for stort hopp på én gang. Vi strekker rep-rommet "
                          f"til 15 først, så blir overgangen til {fmt_kg(up)} kg håndterbar.", n, "15", weight)
         return _plan("weight", _describe(n, BOTTOM_REPS, up),
-                     f"Alle {n} sett nådde {TOP_REPS} reps – dobbel progresjon sier mer vekt: "
+                     f"Alle {len(reps)} sett nådde {min(reps)} reps – dobbel progresjon sier mer vekt: "
                      f"{fmt_kg(logged)} → {fmt_kg(up)} kg (+{int(round(jump_pct))} %). Start på "
                      f"{BOTTOM_REPS} reps og bygg opp mot {TOP_REPS} igjen.", n, f"{BOTTOM_REPS}–{TOP_REPS}", up)
 
     target = min(TOP_REPS, min(reps) + 2)
-    done_text = _describe(len(reps), reps)
+    done = f"Du tok {_describe(len(reps), reps)} på {fmt_kg(logged)} kg. "
     if at_cap:
-        reason = (f"{note}Du tok {done_text} på {fmt_kg(logged)} kg. {fmt_kg(cap)} kg er taket du har satt, "
-                  f"så her bygger vi videre med reps og deretter sett: sikt på {target} per sett.")
+        cap_text = note or f"{fmt_kg(cap)} kg er taket du har satt. "
+        reason = (f"{done}{cap_text}Her bygger vi videre med reps og deretter sett: "
+                  f"sikt på {target} per sett.")
     else:
-        reason = (f"{note}Du tok {done_text} på {fmt_kg(logged)} kg. Bli på vekta og legg på reps til alle "
-                  f"sett når {TOP_REPS} – først da øker vi. Slik vokser volumet før belastningen, og sener "
-                  f"og ledd rekker å henge med.")
+        reason = (f"{done}{note}Bli på vekta og legg på reps til alle sett når {TOP_REPS} – først da "
+                  f"øker vi. Slik vokser volumet før belastningen, og sener og ledd rekker å henge med.")
     return _plan("reps", _describe(n, target, weight), reason, n, str(target), weight)
 
 
@@ -1273,10 +1273,17 @@ def _comeback_plan(ctx, fat_loss, readiness_text):
 
 
 def _strength_plan(ctx, fat_loss, readiness_text):
-    neglected = ctx["neglected"]
+    first_session = ctx["days_since_last"] is None
+    neglected = [] if first_session else ctx["neglected"]     # "never trained" means nothing yet
     exercises, _, _ = _strength_exercises(ctx["progressions"], ctx["last_dates"], neglected, comeback=False)
-    title = "Styrke – helkropp" + (f" med fokus på {neglected[0]['group']}" if neglected else "")
+    if first_session:
+        title = "Styrke – første helkroppsøkt"
+    else:
+        title = "Styrke – helkropp" + (f" med fokus på {neglected[0]['group']}" if neglected else "")
     why = [_alternation_reason(ctx)]
+    if first_session:
+        why.append("Ingen økter registrert ennå, så vi starter med én øvelse for hvert stort "
+                   "bevegelsesmønster: knebøy, hoftehengsel, press og trekk.")
     if neglected:
         why.append(f"{neglect_sentence(neglected[0]['group'], neglected[0]['days_since'])[:-1]}, "
                    f"så vi starter økta der, mens du er uthvilt.")
