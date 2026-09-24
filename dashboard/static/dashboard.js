@@ -404,7 +404,7 @@
     var entries = arr(w.entries).filter(function (e) { return e && has(numv(e.kg)) && parseDate(e.date); });
     var sub = (has(w.start_kg) && has(w.goal_kg)) ? 'Fra ' + numS(w.start_kg) + ' kg mot ' + numS(w.goal_kg) + ' kg' : '';
     var html = cardHead('weight-title', 'scale', 'coral', 'Vektreise', sub,
-      has(w.bmi) ? '<span class="chip chip--neutral" title="Kroppsmasseindeks">BMI ' + numS(w.bmi) + '</span>' : '');
+      has(w.bmi) ? '<span class="chip chip--neutral" title="Kroppsmasseindeks">BMI ' + num(w.bmi, 1) + '</span>' : '');
 
     if (!entries.length || !has(w.current_kg)) {
       html += emptyState({
@@ -590,6 +590,10 @@
       return has(v) ? '<div class="rmetric"><div class="rmetric__head">' + icon(ic, 'icon icon--sm') + '<span>' + label + '</span></div><div class="rmetric__v">' + num(v) + '<small> ' + unit + '</small></div></div>' : '';
     };
     var metrics = sleep + bb + small('heart', 'Hvilepuls', r.resting_hr, 'bpm') + small('wave', 'HRV', r.hrv_ms, 'ms');
+    var extra = [];
+    if (has(r.spo2_avg)) extra.push('<span>' + icon('pulse', 'icon icon--xs') + 'Oksygen (SpO2) <strong>' + num(r.spo2_avg) + ' %</strong></span>');
+    if (has(r.respiration_avg)) extra.push('<span>' + icon('wave', 'icon icon--xs') + 'Pust <strong>' + num(r.respiration_avg) + ' /min</strong></span>');
+    if (extra.length) metrics += '<div class="rextra">' + extra.join('') + '</div>';
 
     html += '<div class="recovery__top">' + '<div class="recovery__ring">' + ringHtml + lbl + '</div>' +
       '<div class="rmetrics">' + metrics + '</div></div>';
@@ -759,7 +763,7 @@
     var hm = arr(obj(DATA.consistency).heatmap);
     var weeks = heatWeeks();
     var cols = weeks.length || 1;
-    var labelW = 30, top = 18, gap = 3;
+    var labelW = W < 400 ? 26 : 30, top = 18, gap = W < 400 ? 2 : 3;
     var cell = clamp(Math.floor((Math.min(W, 640) - labelW) / cols) - gap, 7, 18);
     if (cell >= 14) gap = 4;
     var step = cell + gap;
@@ -1145,9 +1149,9 @@
       input.focus();
       return;
     }
-    if (kg < 30 || kg > 300) {
+    if (kg < 30 || kg > 250) {
       input.setAttribute('aria-invalid', 'true');
-      setMsg('Det ser ikke helt riktig ut. Vekten må være mellom 30 og 300 kg.', 'err');
+      setMsg('Det ser ikke helt riktig ut. Vekten må være mellom 30 og 250 kg.', 'err');
       input.focus();
       return;
     }

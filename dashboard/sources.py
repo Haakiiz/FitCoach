@@ -19,7 +19,9 @@ from pathlib import Path
 
 import httpx
 
-log = logging.getLogger("fitcoach.dashboard")
+# "uvicorn.error" is uvicorn's normal log, so these messages show up in the
+# terminal / journalctl next to uvicorn's own lines (it is not only for errors).
+log = logging.getLogger("uvicorn.error")
 
 # The project folder (the folder that contains hevy_proxy.py)
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -47,7 +49,10 @@ def _number(value, digits: int = 0):
     """Return `value` rounded (int when digits=0), or None if it is not a real number."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if math.isnan(value) or math.isinf(value):
+    try:
+        if math.isnan(value) or math.isinf(value):
+            return None
+    except OverflowError:   # an int too big to be a float, e.g. 10**400
         return None
     if digits == 0:
         return int(round(value))
@@ -108,6 +113,12 @@ async def fetch_all_workouts(api_key: str, force: bool = False) -> list[dict]:
                     break
                 page += 1
 
+        if page > MAX_WORKOUT_PAGES:
+            log.warning(
+                "[dashboard] stopped after %d pages of HEVY workouts (MAX_WORKOUT_PAGES); "
+                "older workouts are not shown", MAX_WORKOUT_PAGES,
+            )
+
         _workouts_cache["workouts"] = workouts
         _workouts_cache["fetched_at"] = time.monotonic()
         return workouts
@@ -117,8 +128,10 @@ async def fetch_all_workouts(api_key: str, force: bool = False) -> list[dict]:
 
 MUSCLES_CACHE_PATH = PROJECT_DIR / "exercise_muscles_cache.json"
 MUSCLES_MAX_AGE_SECONDS = 7 * 24 * 3600   # refresh the file once a week
+MAX_TEMPLATE_PAGES = 50                   # safety net: 50 pages × 100 templates
 
 _muscles_memory: dict[str, str] = {}
+_muscles_lock = asyncio.Lock()
 
 
 async def fetch_template_muscles(api_key: str) -> dict[str, str]:
@@ -127,6 +140,11 @@ async def fetch_template_muscles(api_key: str) -> dict[str, str]:
     The mapping hardly ever changes, so it is saved to exercise_muscles_cache.json
     and only downloaded again when that file is older than 7 days.
     """
+    async with _muscles_lock:   # two page loads at once should only download once
+        return await _fetch_template_muscles(api_key)
+
+
+async def _fetch_template_muscles(api_key: str) -> dict[str, str]:
     # 1) Fresh cache file on disk? Use it.
     if MUSCLES_CACHE_PATH.exists():
         age = time.time() - MUSCLES_CACHE_PATH.stat().st_mtime
@@ -147,7 +165,7 @@ async def fetch_template_muscles(api_key: str) -> dict[str, str]:
     page = 1
     try:
         async with httpx.AsyncClient(headers={"api-key": api_key}, timeout=15) as client:
-            while True:
+            while page <= MAX_TEMPLATE_PAGES:
                 resp = await client.get(
                     f"{HEVY_API_URL}/exercise_templates",
                     params={"page": page, "page_size": 100},
@@ -162,6 +180,9 @@ async def fetch_template_muscles(api_key: str) -> dict[str, str]:
                     if tpl.get("id") and tpl.get("primary_muscle_group"):
                         muscles[tpl["id"]] = tpl["primary_muscle_group"]
                 page += 1
+        if page > MAX_TEMPLATE_PAGES:
+            log.warning("[dashboard] stopped after %d pages of exercise templates (MAX_TEMPLATE_PAGES)",
+                        MAX_TEMPLATE_PAGES)
     except Exception:
         # Download failed: an old cache file is better than nothing
         if MUSCLES_CACHE_PATH.exists():
@@ -178,13 +199,26 @@ async def fetch_template_muscles(api_key: str) -> dict[str, str]:
 
 # ─── Garmin Connect ───
 
-GARMIN_TTL_SECONDS = 30 * 60   # keep Garmin data for 30 minutes
+GARMIN_TTL_SECONDS = 30 * 60        # keep Garmin data for 30 minutes
+GARMIN_ERROR_TTL_SECONDS = 20 * 60  # after a failure, wait 20 minutes before trying again
+GARMIN_TIMEOUT_SECONDS = 25         # give up if Garmin has not answered within 25 seconds
 
-_garmin_cache = {"fetched_at": 0.0, "key": None, "days": None}
-_garmin_client = None          # the logged-in Garmin client, reused between fetches
+_garmin_cache = {"fetched_at": 0.0, "key": None, "days": None, "error": None, "error_at": 0.0}
+_garmin_lock = asyncio.Lock()
+_garmin_client = None               # the logged-in Garmin client, reused between fetches
+
+# After a failed e-mail/password login we do NOT try the password again by
+# ourselves: repeated attempts can trigger MFA e-mails, "429 Too Many Requests"
+# or even lock the account. It is unlocked by ?refresh=1 (the "Oppdater" button)
+# or by restarting the proxy. Saved tokens are still tried every time.
+_password_login_blocked = False
 
 
-class GarminLoginError(Exception):
+class GarminError(Exception):
+    """Something went wrong with Garmin. The message is Norwegian and is shown on the page."""
+
+
+class GarminLoginError(GarminError):
     """Raised when we cannot log in to Garmin Connect."""
 
 
@@ -205,7 +239,11 @@ def _garmin_login():
     2. If that fails, log in with e-mail + password and save new tokens.
     The password is never printed or logged.
     """
-    from garminconnect import Garmin  # imported here so the app starts even without it
+    global _password_login_blocked
+    try:
+        from garminconnect import Garmin  # imported here so the app starts even without it
+    except ImportError as err:
+        raise GarminError("Pakken garminconnect er ikke installert. Kjør pip install -r requirements.txt.") from err
 
     tokenstore = garmin_tokenstore()
 
@@ -217,11 +255,17 @@ def _garmin_login():
     except Exception as err:
         log.info("[garmin] saved tokens not usable (%s), logging in with e-mail/password", type(err).__name__)
 
-    # 2) E-mail + password
+    # 2) E-mail + password (only if the last password login did not fail)
+    if _password_login_blocked:
+        raise GarminLoginError(
+            "Innloggingen mot Garmin feilet tidligere, så passordet prøves ikke på nytt av seg selv "
+            "(for å unngå MFA-e-poster og kontolås). Trykk «Oppdater» eller start proxyen på nytt."
+        )
     try:
         client = Garmin(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
         client.login()
     except Exception as err:
+        _password_login_blocked = True
         text = str(err)
         if "MFA" in text:
             raise GarminLoginError(
@@ -391,36 +435,64 @@ def _fetch_garmin_days_sync(days: int, today: date) -> list[dict]:
     return result   # oldest first, newest last
 
 
+def _garmin_error_message(err: Exception) -> str:
+    """A Norwegian sentence for the page explaining what went wrong."""
+    if isinstance(err, GarminError):
+        return str(err)
+    if isinstance(err, (asyncio.TimeoutError, TimeoutError)):
+        return f"Garmin svarte ikke innen {GARMIN_TIMEOUT_SECONDS} sekunder. Vi prøver igjen om litt."
+    return f"Klarte ikke å hente data fra Garmin ({type(err).__name__}). Vi prøver igjen om litt."
+
+
 async def fetch_garmin_days(days: int = 7, force: bool = False, today: date | None = None) -> list[dict] | None:
     """Fetch the last `days` days from Garmin, normalised as in SCHEMA.md (newest last).
 
-    Returns None when Garmin is not configured. Raises GarminLoginError when the
-    login fails. Cached for 30 minutes.
+    - Returns None when Garmin is not configured.
+    - Good data is cached for 30 minutes.
+    - A failure raises GarminError (Norwegian message) and is remembered for
+      20 minutes, so a broken Garmin does not slow down every page load.
+    - force=True (?refresh=1) skips both caches and allows a new password login.
     """
-    global _garmin_client
+    global _garmin_client, _password_login_blocked
     if not garmin_configured():
         return None
 
     today = today or date.today()
     key = (days, today.isoformat())
-    age = time.monotonic() - _garmin_cache["fetched_at"]
-    if not force and _garmin_cache["key"] == key and age < GARMIN_TTL_SECONDS:
-        return _garmin_cache["days"]
 
-    try:
-        # garminconnect is not async, so we run it in a thread to keep the server responsive
-        result = await asyncio.to_thread(_fetch_garmin_days_sync, days, today)
-    except Exception:
-        _garmin_client = None   # log in again next time
-        raise
+    async with _garmin_lock:   # only one Garmin fetch at a time
+        now = time.monotonic()
+        if force:
+            _password_login_blocked = False
+        else:
+            if _garmin_cache["key"] == key and now - _garmin_cache["fetched_at"] < GARMIN_TTL_SECONDS:
+                return _garmin_cache["days"]
+            if _garmin_cache["error"] and now - _garmin_cache["error_at"] < GARMIN_ERROR_TTL_SECONDS:
+                raise GarminError(_garmin_cache["error"])
 
-    _garmin_cache.update(fetched_at=time.monotonic(), key=key, days=result)
-    return result
+        try:
+            # garminconnect is not async, so it runs in a background thread.
+            # wait_for stops waiting after 25 s (the thread itself finishes on its own later).
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_garmin_days_sync, days, today),
+                timeout=GARMIN_TIMEOUT_SECONDS,
+            )
+        except Exception as err:
+            _garmin_client = None   # log in again next time
+            message = _garmin_error_message(err)
+            log.warning("[garmin] fetch failed: %s", type(err).__name__)
+            _garmin_cache.update(error=message, error_at=time.monotonic())
+            error_class = GarminLoginError if isinstance(err, GarminLoginError) else GarminError
+            raise error_class(message) from err
+
+        _garmin_cache.update(fetched_at=time.monotonic(), key=key, days=result, error=None, error_at=0.0)
+        return result
 
 
 # ─── Weigh-ins (weights.json) ───
 
 MIN_KG, MAX_KG = 30.0, 250.0
+MIN_DATE = date(2000, 1, 1)
 
 
 def weights_path() -> Path:
@@ -457,7 +529,7 @@ def validate_weight(kg, day=None, today: date | None = None) -> tuple[float, str
     if isinstance(kg, str):
         try:
             kg = float(kg.strip().replace(",", "."))
-        except ValueError:
+        except (ValueError, OverflowError):
             raise ValueError("Vekten må være et tall, for eksempel 96,4.")
     kg = _number(kg, 2)
     if kg is None:
@@ -478,6 +550,8 @@ def validate_weight(kg, day=None, today: date | None = None) -> tuple[float, str
         raise ValueError("Datoen må ha formatet ÅÅÅÅ-MM-DD.")
     if day > today:
         raise ValueError("Datoen kan ikke være i fremtiden.")
+    if day < MIN_DATE:
+        raise ValueError("Datoen må være år 2000 eller senere.")
     return kg, day.isoformat()
 
 
