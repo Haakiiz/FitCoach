@@ -15,6 +15,8 @@ Only the standard library is used, and every function is safe to call with odd i
 (unknown titles, None, empty strings).
 """
 
+import math
+
 # ─── Display groups ───
 STRENGTH_GROUPS = ["bryst", "rygg", "skuldre", "armer", "bein", "kjerne"]
 CARDIO_GROUP = "kondis"
@@ -44,7 +46,7 @@ MUSCLE_TO_GROUP = {
 
 # ─── Known exercises ───
 # Keys are HEVY titles *verbatim*. "muscle" uses HEVY's own muscle names.
-# "equipment" is one of: "dumbbell", "barbell", "bodyweight", "cardio".
+# "equipment" is one of: "dumbbell", "barbell", "machine", "bodyweight", "cardio".
 # "cue" is a short coaching tip with the reason behind it (shown in the recommended workout).
 EXERCISES = {
     "Goblet Squat": {
@@ -148,7 +150,7 @@ EXERCISES = {
     "Pull Up": {"label": "Pull-ups", "muscle": "lats", "equipment": "bodyweight"},
     "Chin Up": {"label": "Chin-ups", "muscle": "lats", "equipment": "bodyweight"},
     "Plank": {"label": "Planke", "muscle": "abdominals", "equipment": "bodyweight"},
-    "Crunch": {"label": "Situps (crunch)", "muscle": "abdominals", "equipment": "bodyweight"},
+    "Crunch": {"label": "Crunches", "muscle": "abdominals", "equipment": "bodyweight"},
     "Walking": {"label": "Gange", "muscle": "cardio", "equipment": "cardio"},
 }
 
@@ -167,7 +169,8 @@ _GROUP_KEYWORDS = [
     ("armer", ["curl", "tricep", "skull crusher", "dip", "wrist", "dead hang", "farmer"]),
     ("rygg", ["row", "pull up", "pullup", "chin up", "pulldown", "pull down", "shrug",
               "back extension", "good morning", "superman", "pullover"]),
-    ("bryst", ["bench", "chest", "push up", "pushup", "fly", "floor press", "press"]),
+    ("bryst", ["bench", "chest", "push up", "pushup", "crossover", "cable fly", "fly",
+               "floor press", "press"]),
     ("bein", ["squat", "lunge", "deadlift", "step up", "split", "leg", "hip", "box jump"]),
 ]
 
@@ -235,8 +238,8 @@ def group(title, template_id=None, template_muscles=None):
     2. Our table of known titles.
     3. Keywords in the title.
     """
-    muscles = template_muscles or {}
-    hevy_muscle = muscles.get(template_id) if template_id else None
+    muscles = template_muscles if isinstance(template_muscles, dict) else {}
+    hevy_muscle = muscles.get(template_id) if isinstance(template_id, str) else None
     if hevy_muscle in MUSCLE_TO_GROUP:
         return MUSCLE_TO_GROUP[hevy_muscle]
     info = _known(title)
@@ -247,26 +250,48 @@ def group(title, template_id=None, template_muscles=None):
 
 def muscle(title, template_id=None, template_muscles=None):
     """HEVY-style primary muscle (e.g. 'hamstrings'), or None when unknown."""
-    muscles = template_muscles or {}
-    if template_id and muscles.get(template_id):
+    muscles = template_muscles if isinstance(template_muscles, dict) else {}
+    if isinstance(template_id, str) and muscles.get(template_id):
         return muscles[template_id]
     info = _known(title)
     return info["muscle"] if info else None
 
 
 def equipment_kind(title):
-    """'dumbbell', 'barbell', 'bodyweight' or 'cardio' for an exercise title."""
+    """'dumbbell', 'barbell', 'machine', 'bodyweight' or 'cardio' for an exercise title.
+
+    "machine" covers machines, cables, Smith machines and bands: loads we cannot round
+    to the home rack, so they simply go up and down in 2.5 kg steps.
+    """
     info = _known(title)
     if info:
         return info["equipment"]
     lower = _clean(title).lower()
     if _group_from_keywords(title) == "kondis":
         return "cardio"
+    if any(word in lower for word in _MACHINE_WORDS):
+        return "machine"
     if "dumbbell" in lower or "goblet" in lower or "kettlebell" in lower:
         return "dumbbell"
     if "barbell" in lower or "ez bar" in lower or "z bar" in lower or "z-bar" in lower:
         return "barbell"
     return "bodyweight"
+
+
+_MACHINE_WORDS = ["(machine)", "(cable)", "(smith machine)", "(band)", "machine", "cable", "smith"]
+
+
+def to_number(value):
+    """Safe float conversion: numbers and numeric strings -> float; None/bool/text/NaN/inf -> None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
 
 
 def is_cardio(exercise, template_muscles=None):
@@ -279,8 +304,9 @@ def is_cardio(exercise, template_muscles=None):
         return False
     if group(exercise.get("title"), exercise.get("exercise_template_id"), template_muscles) == "kondis":
         return True
-    for s in exercise.get("sets") or []:
-        if isinstance(s, dict) and (s.get("distance_meters") or 0) > 0:
+    sets = exercise.get("sets")
+    for s in sets if isinstance(sets, list) else []:
+        if isinstance(s, dict) and (to_number(s.get("distance_meters")) or 0) > 0:
             return True
     return False
 
@@ -290,10 +316,25 @@ def weight_cap(title):
     return WEIGHT_CAPS_KG.get(canonical_title(title))
 
 
-def _rack_kind(title):
-    """Which set of weights to round to. Bodyweight moves are loaded by holding dumbbells."""
+def load_kind(title):
+    """How the external load is chosen: 'dumbbell', 'barbell', 'machine' or None (cardio).
+
+    - Known bodyweight moves (lunges, calf raises, push-ups) are loaded by holding
+      dumbbells, so they use the dumbbell rack.
+    - Unknown titles that still carry weight are treated as 'machine': we cannot know
+      the equipment, so we only use plain 2.5 kg steps and never talk about "your dumbbells".
+    """
     kind = equipment_kind(title)
-    return "dumbbell" if kind == "bodyweight" else kind
+    if kind == "cardio":
+        return None
+    if kind == "bodyweight":
+        return "dumbbell" if _known(title) else "machine"
+    return kind
+
+
+def _step_floor(kg):
+    """Largest multiple of 2.5 kg that is <= kg."""
+    return int(kg / BARBELL_STEP_KG + 1e-9) * BARBELL_STEP_KG
 
 
 def round_to_available(title, kg):
@@ -303,21 +344,16 @@ def round_to_available(title, kg):
     Romanian Deadlift (Barbell) 100 kg -> 90 kg (the user's cap). Ties round down, because
     a slightly lighter weight is the safer mistake. Returns None for cardio or bad input.
     """
-    try:
-        kg = float(kg)
-    except (TypeError, ValueError):
-        return None
-    if kg <= 0:
-        return None
-    kind = _rack_kind(title)
-    if kind == "cardio":
+    kg = to_number(kg)
+    kind = load_kind(title)
+    if kg is None or kg <= 0 or kind is None:
         return None
     if kind == "dumbbell":
-        best = min(DUMBBELLS_KG, key=lambda d: (abs(d - kg), d))
-        result = float(best)
+        result = float(min(DUMBBELLS_KG, key=lambda d: (abs(d - kg), d)))
     else:
         steps = round(kg / BARBELL_STEP_KG - 1e-9)      # tiny nudge so exact halves round down
-        result = max(BARBELL_MIN_KG, steps * BARBELL_STEP_KG)
+        minimum = BARBELL_MIN_KG if kind == "barbell" else BARBELL_STEP_KG
+        result = max(minimum, steps * BARBELL_STEP_KG)
     cap = weight_cap(title)
     if cap is not None:
         result = min(result, cap)
@@ -327,20 +363,21 @@ def round_to_available(title, kg):
 def next_weight_up(title, kg):
     """The next heavier weight that exists, or None if you are at the top (or at your cap).
 
-    Dumbbells jump along the rack (…, 9, 10, 16, 22, 24 kg); barbells go up 2.5 kg.
+    Dumbbells jump along the rack (…, 9, 10, 16, 22, 24 kg); barbells go up 2.5 kg;
+    machines/cables go up 2.5 kg or 5 %, whichever is larger.
     """
-    try:
-        kg = float(kg)
-    except (TypeError, ValueError):
-        return None
-    kind = _rack_kind(title)
-    if kind == "cardio":
+    kg = to_number(kg)
+    kind = load_kind(title)
+    if kg is None or kind is None:
         return None
     if kind == "dumbbell":
         heavier = [float(d) for d in DUMBBELLS_KG if d > kg + 1e-9]
         candidate = heavier[0] if heavier else None
+    elif kind == "barbell":
+        candidate = max(BARBELL_MIN_KG, _step_floor(kg) + BARBELL_STEP_KG)
     else:
-        candidate = max(BARBELL_MIN_KG, (int(kg / BARBELL_STEP_KG + 1e-9) + 1) * BARBELL_STEP_KG)
+        wanted = kg + max(BARBELL_STEP_KG, kg * 0.05)
+        candidate = math.ceil(wanted / BARBELL_STEP_KG - 1e-9) * BARBELL_STEP_KG
     cap = weight_cap(title)
     if candidate is not None and cap is not None and candidate > cap + 1e-9:
         return None
@@ -349,20 +386,49 @@ def next_weight_up(title, kg):
 
 def next_weight_down(title, kg):
     """The next lighter weight that exists, or None if there is nothing lighter."""
-    try:
-        kg = float(kg)
-    except (TypeError, ValueError):
-        return None
-    kind = _rack_kind(title)
-    if kind == "cardio":
+    kg = to_number(kg)
+    kind = load_kind(title)
+    if kg is None or kind is None:
         return None
     if kind == "dumbbell":
         lighter = [float(d) for d in DUMBBELLS_KG if d < kg - 1e-9]
         return lighter[-1] if lighter else None
-    candidate = (int(kg / BARBELL_STEP_KG - 1e-9)) * BARBELL_STEP_KG
+    candidate = _step_floor(kg)
     if abs(candidate - kg) < 1e-9:
         candidate -= BARBELL_STEP_KG
-    return candidate if candidate >= BARBELL_MIN_KG else None
+    minimum = BARBELL_MIN_KG if kind == "barbell" else BARBELL_STEP_KG
+    return candidate if candidate >= minimum else None
+
+
+def deload_weight(title, kg, factor, floor_pct=0.55):
+    """A lighter restart weight after a break: the heaviest existing weight <= kg × factor.
+
+    With a gappy dumbbell rack the exact percentage is rarely available, so we accept
+    anything down to `floor_pct` (55 %). If nothing fits in that window we take the
+    heaviest weight at or below 80 %, and as a last resort one step down.
+    Example: 22 kg × 0.7 = 15.4 -> 16 kg is allowed (small tolerance), 16 kg × 0.7 -> 10 kg.
+    """
+    kg, factor = to_number(kg), to_number(factor)
+    kind = load_kind(title)
+    if kg is None or kg <= 0 or factor is None or kind is None:
+        return None
+    if kind == "dumbbell":
+        options = [float(d) for d in DUMBBELLS_KG]
+        limit = kg * factor * 1.05                       # 5 % tolerance for the rack gaps
+    else:
+        minimum = BARBELL_MIN_KG if kind == "barbell" else BARBELL_STEP_KG
+        options = [minimum + i * BARBELL_STEP_KG for i in range(int((kg - minimum) / BARBELL_STEP_KG) + 1)]
+        limit = kg * factor
+    cap = weight_cap(title)
+    if cap is not None:
+        options = [o for o in options if o <= cap]
+    in_window = [o for o in options if kg * floor_pct - 1e-9 <= o <= limit + 1e-9]
+    if in_window:
+        return max(in_window)
+    below_80 = [o for o in options if o <= kg * 0.8 + 1e-9]
+    if below_80:
+        return max(below_80)
+    return next_weight_down(title, kg) or kg
 
 
 def max_available(title):
@@ -370,6 +436,6 @@ def max_available(title):
     cap = weight_cap(title)
     if cap is not None:
         return cap
-    if _rack_kind(title) == "dumbbell":
+    if load_kind(title) == "dumbbell":
         return float(DUMBBELLS_KG[-1])
     return None

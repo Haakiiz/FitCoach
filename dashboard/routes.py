@@ -1,6 +1,8 @@
 """Web routes for the dashboard.
 
     GET  /dashboard          → the HTML page
+    GET  /dashboard/login    → a small login form (only used when DASHBOARD_TOKEN is set)
+    POST /dashboard/login    → checks the token from the form and sets a login cookie
     GET  /dashboard/api      → the same data as JSON (?refresh=1 fetches fresh data)
     POST /dashboard/weight   → save a weigh-in, body: {"kg": 96.4, "date": "2026-09-24"}
 
@@ -9,14 +11,18 @@ All routes use include_in_schema=False, so they do NOT show up in /openapi.json
 """
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
+import jinja2  # noqa: F401  (imported so a missing package gives a clear ImportError)
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -31,7 +37,8 @@ from .demo_data import (
     demo_workouts,
 )
 
-log = logging.getLogger("fitcoach.dashboard")
+# "uvicorn.error" is uvicorn's normal log, so these messages show up next to uvicorn's own lines
+log = logging.getLogger("uvicorn.error")
 
 router = APIRouter()
 
@@ -42,6 +49,7 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 COOKIE_NAME = "fitcoach_dash"
 COOKIE_MAX_AGE = 90 * 24 * 3600   # 90 days
+LOGIN_FAIL_DELAY = 1.0            # seconds to wait after a wrong token (slows down guessing)
 
 # Weigh-ins added while in demo mode without WEIGHTS_PATH (kept in memory only)
 _demo_added_weights: list[dict] = []
@@ -63,7 +71,29 @@ def _local_now() -> datetime:
     return datetime.now(_local_tz())
 
 
-# ─── Access control (DASHBOARD_TOKEN) ───
+# ─── Access control ───
+#
+# With DASHBOARD_TOKEN set (recommended):
+#   - the browser logs in once on /dashboard/login and gets a cookie (90 days)
+#   - curl/scripts can send the header  "Authorization: Bearer <token>"  to the API routes
+#   The token is never put in the URL, so it can't leak into logs or browser history.
+#
+# Without DASHBOARD_TOKEN:
+#   - only direct requests from this machine or the home network get in
+#     (not requests that come through ngrok, which adds X-Forwarded-* headers)
+#   - demo mode (FITCOACH_DEMO) is always open, since it only shows made-up data
+
+# Networks that count as "local": this machine and ordinary home networks
+LOCAL_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+]
+# Headers a proxy such as ngrok adds. If any is present, the request came from outside.
+PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "forwarded")
+
 
 def _cookie_value(token: str) -> str:
     """What we store in the cookie: a fingerprint (hash) of the token, not the token itself."""
@@ -75,45 +105,51 @@ def _same(a: str, b: str) -> bool:
     return secrets.compare_digest(a.encode(), b.encode())
 
 
-def _denied(api: bool) -> Response:
+def _is_local_direct(request: Request) -> bool:
+    """True when the request comes straight from this machine or the home network."""
+    if any(header in request.headers for header in PROXY_HEADERS):
+        return False
+    host = request.client.host if request.client else ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False   # not an IP address at all
+    if ip.version == 6 and ip.ipv4_mapped:   # "::ffff:127.0.0.1" is really 127.0.0.1
+        ip = ip.ipv4_mapped
+    return any(ip in net for net in LOCAL_NETWORKS)
+
+
+def _has_valid_login(request: Request, token: str, api: bool) -> bool:
+    """A valid login cookie, or (API routes only) a valid "Authorization: Bearer" header."""
+    cookie = request.cookies.get(COOKIE_NAME)
+    if cookie and _same(cookie, _cookie_value(token)):
+        return True
     if api:
-        return JSONResponse({"ok": False, "error": "Ingen tilgang. Åpne dashboardet med riktig nøkkel."}, status_code=401)
-    return HTMLResponse(DENIED_HTML, status_code=401)
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer ") and _same(auth[7:].strip(), token):
+            return True
+    return False
+
+
+def _is_allowed(request: Request, api: bool) -> bool:
+    token = os.getenv("DASHBOARD_TOKEN", "")
+    if token:
+        return _has_valid_login(request, token, api)
+    return bool(demo_scenario()) or _is_local_direct(request)
 
 
 def _check_access(request: Request, api: bool) -> Response | None:
-    """Return None when the visitor may continue, otherwise a response to send back.
-
-    - No DASHBOARD_TOKEN set          → open for everyone (a warning is logged at startup)
-    - ?key=TOKEN on /dashboard        → set a cookie and redirect to /dashboard (hides the key)
-    - ?key=TOKEN on the API routes    → allowed (handy for curl)
-    - valid cookie                    → allowed
-    - anything else                   → 401
-    """
-    token = os.getenv("DASHBOARD_TOKEN", "")
-    if not token:
+    """Return None when the visitor may continue, otherwise the response to send back."""
+    if _is_allowed(request, api):
         return None
-
-    key = request.query_params.get("key")
-    if key is not None and _same(key, token):
-        if api:
-            return None
-        response = RedirectResponse("/dashboard", status_code=303)
-        is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
-        response.set_cookie(
-            COOKIE_NAME,
-            _cookie_value(token),
-            max_age=COOKIE_MAX_AGE,
-            httponly=True,
-            samesite="lax",
-            secure=is_https,
+    if api:
+        return JSONResponse(
+            {"ok": False, "error": "Ingen tilgang. Logg inn på /dashboard/login først."},
+            status_code=401,
         )
-        return response
-
-    cookie = request.cookies.get(COOKIE_NAME)
-    if cookie and _same(cookie, _cookie_value(token)):
-        return None
-    return _denied(api)
+    if os.getenv("DASHBOARD_TOKEN"):
+        return RedirectResponse("/dashboard/login", status_code=303)
+    return HTMLResponse(NO_TOKEN_HTML, status_code=401, headers=NO_STORE)
 
 
 # ─── Collect the data and build the dashboard ───
@@ -175,7 +211,7 @@ async def _gather_inputs(today: date, force: bool) -> dict:
         garmin_days = None
     elif isinstance(garmin_days, Exception):
         log.warning("[dashboard] Garmin failed: %s", type(garmin_days).__name__)
-        if isinstance(garmin_days, sources.GarminLoginError):
+        if isinstance(garmin_days, sources.GarminError):
             errors.append(str(garmin_days))
         else:
             errors.append("Klarte ikke å hente data fra Garmin. Prøv igjen senere.")
@@ -221,8 +257,13 @@ async def build_data(force: bool = False) -> dict:
 
 
 def _to_script_json(data: dict) -> str:
-    """JSON that is safe to put inside a <script> tag ("</" can't close the tag)."""
-    return json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    """JSON that is safe to put inside a <script> tag.
+
+    <, > and & are written as \\u003c, \\u003e and \\u0026. JSON reads them back
+    as the same characters, but the browser can never see "</script>" or "<!--" in them.
+    """
+    text = json.dumps(data, ensure_ascii=False)
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 NO_STORE = {"Cache-Control": "no-store"}   # personal data: don't let browsers/proxies keep copies
@@ -252,6 +293,46 @@ async def dashboard_page(request: Request):
         {"request": request, "data": data, "data_json": _to_script_json(data)},
         headers=NO_STORE,
     )
+
+
+@router.get("/dashboard/login", include_in_schema=False)
+async def login_page(request: Request):
+    """Show the login form (or go straight to the dashboard when no login is needed)."""
+    if _is_allowed(request, api=False):
+        return RedirectResponse("/dashboard", status_code=303)
+    if not os.getenv("DASHBOARD_TOKEN"):
+        return HTMLResponse(NO_TOKEN_HTML, status_code=401, headers=NO_STORE)
+    return HTMLResponse(_login_html(), headers=NO_STORE)
+
+
+@router.post("/dashboard/login", include_in_schema=False)
+async def login_submit(request: Request):
+    """Check the token from the form. Right token → cookie + back to /dashboard."""
+    token = os.getenv("DASHBOARD_TOKEN", "")
+    if not token:
+        return RedirectResponse("/dashboard", status_code=303)
+
+    # The form is sent as "token=...". We read it by hand (FastAPI's form
+    # support needs an extra package). The token is in the body, never in the URL.
+    body = await request.body()
+    fields = parse_qs(body[:4096].decode("utf-8", errors="replace"))
+    given = (fields.get("token") or [""])[0].strip()
+
+    if not given or not _same(given, token):
+        await asyncio.sleep(LOGIN_FAIL_DELAY)   # makes guessing slow
+        return HTMLResponse(_login_html(error="Feil nøkkel. Prøv igjen."), status_code=401, headers=NO_STORE)
+
+    response = RedirectResponse("/dashboard", status_code=303)
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+    response.set_cookie(
+        COOKIE_NAME,
+        _cookie_value(token),
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,        # JavaScript can't read it
+        samesite="lax",       # other websites can't send it along with their forms
+        secure=is_https,      # only sent over https when we are on https (ngrok)
+    )
+    return response
 
 
 @router.get("/dashboard/api", include_in_schema=False)
@@ -293,6 +374,8 @@ async def dashboard_weight(request: Request):
                 sources.add_weight(sources.weights_path(), body["kg"], body.get("date"), today)
     except ValueError as err:
         return JSONResponse({"ok": False, "error": str(err)}, status_code=400)
+    except (OverflowError, TypeError):
+        return JSONResponse({"ok": False, "error": "Vekten må være et tall, for eksempel 96,4."}, status_code=400)
     except Exception:
         log.exception("[dashboard] saving weight failed")
         return JSONResponse({"ok": False, "error": "Klarte ikke å lagre vekten. Prøv igjen."}, status_code=500)
@@ -305,6 +388,26 @@ async def dashboard_weight(request: Request):
     return JSONResponse({"ok": True, "weight": data["weight"]}, headers=NO_STORE)
 
 
+# ─── Hide secrets in uvicorn's access log ───
+
+class MaskKeyFilter(logging.Filter):
+    """Replaces "key=<anything>" in access-log lines with "key=***".
+
+    The dashboard no longer puts the token in the URL, but an old bookmark
+    like /dashboard?key=... must still never end up in the log.
+    """
+    PATTERN = re.compile(r"([?&]key=)[^&\s\"]*", re.IGNORECASE)
+
+    def _mask(self, value):
+        return self.PATTERN.sub(r"\1***", value) if isinstance(value, str) else value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._mask(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._mask(arg) for arg in record.args)
+        return True   # keep the line, just masked
+
+
 # ─── Hook the dashboard into the main app ───
 
 def install(app: FastAPI) -> None:
@@ -313,42 +416,77 @@ def install(app: FastAPI) -> None:
     app.include_router(router)
     app.mount("/dashboard/static", StaticFiles(directory=str(STATIC_DIR)), name="dashboard_static")
 
+    access_log = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, MaskKeyFilter) for f in access_log.filters):
+        access_log.addFilter(MaskKeyFilter())
+
     scenario = demo_scenario()
     if scenario:
         print(f"[dashboard] DEMO MODE ({scenario}): showing made-up data, no calls to HEVY or Garmin.")
     if not os.getenv("DASHBOARD_TOKEN"):
         print(
-            "[dashboard] WARNING: DASHBOARD_TOKEN is not set, so /dashboard is open to anyone "
-            "who knows the ngrok address. Set DASHBOARD_TOKEN in .hevy_env to protect it."
+            "[dashboard] WARNING: DASHBOARD_TOKEN is not set. /dashboard only answers direct requests "
+            "from this machine or the home network (not via ngrok). Set DASHBOARD_TOKEN in .hevy_env "
+            "to use it from anywhere."
         )
 
 
-# ─── Small HTML pages (used when something is missing or wrong) ───
+# ─── Small HTML pages (login, errors) ───
 
 _PAGE = """<!doctype html>
-<html lang="no"><head><meta charset="utf-8">
+<html lang="nb"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
 <meta name="robots" content="noindex">
 <title>FitCoach</title>
 <style>
+  * {{ box-sizing: border-box; }}
   body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
-         background: #FAF7F2; color: #2B2724; box-sizing: border-box;
+         background: #FAF7F2; color: #2B2724;
          font-family: "Plus Jakarta Sans", system-ui, -apple-system, "Segoe UI", sans-serif; }}
-  .card {{ background: #fff; border-radius: 24px; padding: 32px; max-width: 420px;
+  .card {{ background: #fff; border-radius: 24px; padding: 32px; width: 100%; max-width: 420px;
           box-shadow: 0 12px 40px rgba(60, 40, 20, .08); border: 1px solid #EFE9E1; }}
   h1 {{ font-size: 22px; margin: 0 0 8px; }}
   p {{ color: #5E5750; line-height: 1.5; margin: 8px 0 0; }}
-  a {{ color: #E0522F; }}
-  code {{ background: #F5F0E8; padding: 2px 6px; border-radius: 6px; }}
+  a {{ color: #C2410C; }}
+  code {{ background: #F5F0E8; padding: 2px 6px; border-radius: 6px; word-break: break-all; }}
+  label {{ display: block; font-size: 13px; color: #5E5750; margin: 20px 0 6px; }}
+  input {{ width: 100%; font: inherit; padding: 12px 14px; border-radius: 14px;
+          border: 1px solid #E6DED3; background: #FFFDFA; color: inherit; }}
+  input:focus {{ outline: 2px solid #E8553A; outline-offset: 1px; }}
+  button {{ margin-top: 16px; width: 100%; font: inherit; font-weight: 600; color: #fff;
+           background: #E8553A; border: 0; border-radius: 14px; padding: 12px 16px; cursor: pointer; }}
+  button:hover {{ background: #D94A30; }}
+  .error {{ color: #B42318; font-weight: 600; }}
 </style></head>
 <body><main class="card">{body}</main></body></html>
 """
 
-DENIED_HTML = _PAGE.format(body="""
-<h1>Her trengs en nøkkel</h1>
-<p>Dette dashboardet er privat. Åpne lenken med nøkkelen din, slik:
-<code>/dashboard?key=DIN_NØKKEL</code></p>
+_LOGIN_BODY = """
+<h1>Velkommen til FitCoach</h1>
+<p>Skriv inn nøkkelen din for å åpne dashboardet. Du blir husket på denne enheten i 90 dager.</p>
+{error}
+<form method="post" action="/dashboard/login">
+  <label for="token">Nøkkel</label>
+  <input id="token" name="token" type="password" autocomplete="current-password" required autofocus>
+  <button type="submit">Logg inn</button>
+</form>
 <p>Nøkkelen er verdien av <code>DASHBOARD_TOKEN</code> i <code>.hevy_env</code> på Pi-en.</p>
+"""
+
+
+def _login_html(error: str = "") -> str:
+    error_html = f'<p class="error" role="alert">{error}</p>' if error else ""
+    return _PAGE.format(body=_LOGIN_BODY.format(error=error_html))
+
+
+NO_TOKEN_HTML = _PAGE.format(body="""
+<h1>Dashboardet er låst</h1>
+<p>Uten nøkkel svarer dashboardet bare på maskinen selv og hjemmenettet, ikke via ngrok.</p>
+<p>Slik åpner du det fra hvor som helst:</p>
+<p>1. Legg til en lang, tilfeldig nøkkel i <code>.hevy_env</code> på Pi-en:<br>
+<code>DASHBOARD_TOKEN=din-lange-nøkkel</code></p>
+<p>2. Start proxyen på nytt og logg inn på <code>/dashboard/login</code>.</p>
 """)
 
 FALLBACK_HTML = _PAGE.format(body="""

@@ -20,7 +20,7 @@
   function esc(s) {
     return String(has(s) ? s : '').replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
+    }).replace(/(\d) (%|kg\b|km\b|min\b|sek\b)/g, '$1\u00A0$2');
   }
   function cap(s) { s = String(s || ''); return s.charAt(0).toUpperCase() + s.slice(1); }
 

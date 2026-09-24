@@ -514,8 +514,12 @@ path[data-tip]:hover, circle.dot-teal:hover { opacity: .85; }
 
 /* ───────── Responsivt ───────── */
 @media (max-width: 1180px) {
-  .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: row dense; }
+  .span-2 { grid-column: span 1; }
   .span-3, .span-4 { grid-column: span 2; }
+  .vol { grid-template-columns: minmax(0, 1fr); }
+  .weight__top, .recovery__top { grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 20px; }
+  .stats, .rmetrics { width: 100%; }
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lifts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rec__body { grid-template-columns: minmax(0, 1fr); }

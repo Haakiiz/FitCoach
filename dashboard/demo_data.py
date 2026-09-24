@@ -190,7 +190,9 @@ def demo_workouts(today: date, scenario: str = "active") -> list[dict]:
 
     3–4 sessions a week, alternating strength and running. In "active" the
     last workout is 2 days before `today`, in "comeback" it is 99 days before.
-    Shoulders (only trained in session B) are left alone for the last 16 days.
+    Shoulders are only trained in session B, and B is skipped in the last 16 days
+    before the last workout. In "active" that means no shoulder work for at least
+    18 days before `today` (18–29 days, depending on the weekday of `today`).
     """
     rng = random.Random(42)
     last_day = today - timedelta(days=99 if scenario == "comeback" else 2)
