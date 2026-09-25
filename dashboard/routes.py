@@ -15,9 +15,11 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
+import time
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -50,13 +52,12 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 COOKIE_NAME = "fitcoach_dash"
 COOKIE_MAX_AGE = 90 * 24 * 3600   # 90 days
-LOGIN_FAIL_DELAY = 1.0            # seconds to wait after a wrong token (slows down guessing)
+MAX_LOGIN_BODY = 4096            # the login form is tiny; refuse anything bigger
 REFRESH_HEADER = "x-fitcoach-refresh"   # the page sends "X-FitCoach-Refresh: 1" to skip the caches
 
 # Weigh-ins added in demo mode (kept in memory only, so an open demo never writes to disk)
 _demo_added_weights: list[dict] = []
 _weight_lock = asyncio.Lock()
-_login_lock = asyncio.Lock()      # login attempts are checked one at a time
 
 
 # ─── Settings from the environment ───
@@ -84,7 +85,9 @@ def _local_now() -> datetime:
 # Without DASHBOARD_TOKEN:
 #   - only direct requests from this machine or the home network get in
 #     (not requests that come through ngrok, which adds X-Forwarded-* headers)
-#   - demo mode (FITCOACH_DEMO) is always open, since it only shows made-up data
+#   - demo mode (FITCOACH_DEMO) is open, since it only shows made-up data
+#   - in both cases the address in the browser must be a name we know
+#     (localhost, an IP address, *.local or DASHBOARD_ALLOWED_HOSTS)
 
 # Networks that count as "local": this machine and ordinary home networks
 LOCAL_NETWORKS = [
@@ -131,36 +134,122 @@ def _is_local_direct(request: Request) -> bool:
     return any(ip in net for net in LOCAL_NETWORKS)
 
 
-def _has_valid_login(request: Request, token: str, api: bool) -> bool:
-    """A valid login cookie, or (API routes only) a valid "Authorization: Bearer" header."""
-    cookie = request.cookies.get(COOKIE_NAME)
-    if cookie and _same(cookie, _cookie_value(token)):
+def _host_name_allowed(request: Request) -> bool:
+    """Protection against "DNS rebinding" when access is based on the IP address.
+
+    A bad website can make its own name (e.g. rebind.attacker.example) point to
+    127.0.0.1 or the Pi, and then its JavaScript could read the dashboard. The
+    browser still sends the attacker's name in the Host header, so we only accept
+    names we know: localhost, a plain IP address, *.local, or a name listed in
+    DASHBOARD_ALLOWED_HOSTS (comma-separated, e.g. "pi.hjemme,fitcoach.lan").
+    """
+    name = (request.url.hostname or "").lower().rstrip(".")
+    if name == "localhost" or name.endswith(".local"):
         return True
-    if api:
-        auth = request.headers.get("authorization", "")
-        if auth.lower().startswith("bearer ") and _same(auth[7:].strip(), token):
-            return True
-    return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    extra = os.getenv("DASHBOARD_ALLOWED_HOSTS", "")
+    return name in {h.strip().lower().rstrip(".") for h in extra.split(",") if h.strip()}
 
 
-def _is_allowed(request: Request, api: bool) -> bool:
-    token = os.getenv("DASHBOARD_TOKEN", "")
-    if token:
-        return _has_valid_login(request, token, api)
-    return bool(demo_scenario()) or _is_local_direct(request)
+# ─── Brake on wrong keys (per IP address) ───
+# The first FREE_TRIES wrong keys from one address are free (typos happen).
+# After that the address must wait 2, 4, 8 … seconds (max 5 min) before the
+# next try, and gets "429 Too Many Requests" until then. Other addresses (e.g.
+# you on your phone) are not affected. This slows guessing down, but an attacker
+# with many IP addresses is not stopped by it – the long random key is the real
+# protection.
 
+FREE_TRIES = 3
+MAX_WAIT_SECONDS = 300
+_failed_tries: dict[str, tuple[int, float]] = {}   # ip → (wrong tries in a row, time of the last one)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "?"
+
+
+def _seconds_to_wait(ip: str) -> int:
+    """How long `ip` must still wait before it may try a key again (0 = go ahead)."""
+    count, last = _failed_tries.get(ip, (0, 0.0))
+    if count < FREE_TRIES:
+        return 0
+    wait = min(2 ** (count - FREE_TRIES + 1), MAX_WAIT_SECONDS)
+    return max(0, math.ceil(last + wait - time.monotonic()))
+
+
+def _record_wrong_try(ip: str) -> None:
+    count, _ = _failed_tries.get(ip, (0, 0.0))
+    _failed_tries[ip] = (count + 1, time.monotonic())
+    if len(_failed_tries) > 1000:   # forget addresses that have been quiet for an hour
+        cutoff = time.monotonic() - 3600
+        for old_ip in [k for k, (_, t) in _failed_tries.items() if t < cutoff]:
+            del _failed_tries[old_ip]
+
+
+def _check_key(ip: str, given: str, token: str) -> str:
+    """Check a typed key or Bearer key. Returns "ok", "wrong" or "wait".
+
+    There is no `await` in here, so even many requests at the same time are
+    counted one by one.
+    """
+    if _seconds_to_wait(ip) > 0:
+        return "wait"
+    if given and _same(given, token):
+        _failed_tries.pop(ip, None)
+        return "ok"
+    _record_wrong_try(ip)
+    return "wrong"
+
+
+def _too_many_tries_json(ip: str) -> JSONResponse:
+    wait = _seconds_to_wait(ip)
+    return JSONResponse(
+        {"ok": False, "error": f"For mange feil nøkler. Vent {wait} sekunder og prøv igjen."},
+        status_code=429, headers={"Retry-After": str(wait)},
+    )
+
+
+# ─── Who may see the dashboard? ───
 
 def _check_access(request: Request, api: bool) -> Response | None:
     """Return None when the visitor may continue, otherwise the response to send back."""
-    if _is_allowed(request, api):
-        return None
+    token = os.getenv("DASHBOARD_TOKEN", "")
+
+    if token:
+        cookie = request.cookies.get(COOKIE_NAME)
+        if cookie and _same(cookie, _cookie_value(token)):
+            return None
+        auth = request.headers.get("authorization", "")
+        if api and auth.lower().startswith("bearer "):
+            result = _check_key(_client_ip(request), auth[7:].strip(), token)
+            if result == "ok":
+                return None
+            if result == "wait":
+                return _too_many_tries_json(_client_ip(request))
+        if api:
+            return JSONResponse(
+                {"ok": False, "error": "Ingen tilgang. Logg inn på /dashboard/login først."},
+                status_code=401,
+            )
+        return RedirectResponse("/dashboard/login", status_code=303)
+
+    # No token: only direct local visitors (or demo), and only under a known name
+    if demo_scenario() or _is_local_direct(request):
+        if _host_name_allowed(request):
+            return None
+        if api:
+            return JSONResponse({"ok": False, "error": WRONG_HOST_TEXT}, status_code=403)
+        return HTMLResponse(WRONG_HOST_HTML, status_code=403, headers=NO_STORE)
+
     if api:
         return JSONResponse(
-            {"ok": False, "error": "Ingen tilgang. Logg inn på /dashboard/login først."},
+            {"ok": False, "error": "Ingen tilgang. Sett DASHBOARD_TOKEN i .hevy_env for å bruke dashboardet utenfra."},
             status_code=401,
         )
-    if os.getenv("DASHBOARD_TOKEN"):
-        return RedirectResponse("/dashboard/login", status_code=303)
     return HTMLResponse(NO_TOKEN_HTML, status_code=401, headers=NO_STORE)
 
 
@@ -332,10 +421,13 @@ async def dashboard_page(request: Request):
 @router.get("/dashboard/login", include_in_schema=False)
 async def login_page(request: Request):
     """Show the login form (or go straight to the dashboard when no login is needed)."""
-    if _is_allowed(request, api=False):
+    token = os.getenv("DASHBOARD_TOKEN", "")
+    if not token:
+        blocked = _check_access(request, api=False)
+        return blocked if blocked is not None else RedirectResponse("/dashboard", status_code=303)
+    cookie = request.cookies.get(COOKIE_NAME)
+    if cookie and _same(cookie, _cookie_value(token)):
         return RedirectResponse("/dashboard", status_code=303)
-    if not os.getenv("DASHBOARD_TOKEN"):
-        return HTMLResponse(NO_TOKEN_HTML, status_code=401, headers=NO_STORE)
     return HTMLResponse(_login_html(), headers=NO_STORE)
 
 
@@ -351,16 +443,29 @@ async def login_submit(request: Request):
 
     # The form is sent as "token=...". We read it by hand (FastAPI's form
     # support needs an extra package). The token is in the body, never in the URL.
-    body = await request.body()
-    fields = parse_qs(body[:4096].decode("utf-8", errors="replace"))
+    # We read at most 4096 bytes, so nobody can make us swallow a huge upload.
+    too_big = HTMLResponse(_login_html(error="Forespørselen var for stor."), status_code=413, headers=NO_STORE)
+    try:
+        if int(request.headers.get("content-length") or 0) > MAX_LOGIN_BODY:
+            return too_big
+    except ValueError:
+        return too_big
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_LOGIN_BODY:
+            return too_big
+    fields = parse_qs(body.decode("utf-8", errors="replace"))
     given = (fields.get("token") or [""])[0].strip()
 
-    # One attempt at a time, and a wrong one waits 1 s while holding the lock.
-    # So even many guesses sent at once are answered at most one per second.
-    async with _login_lock:
-        if not given or not _same(given, token):
-            await asyncio.sleep(LOGIN_FAIL_DELAY)
-            return HTMLResponse(_login_html(error="Feil nøkkel. Prøv igjen."), status_code=401, headers=NO_STORE)
+    ip = _client_ip(request)
+    result = _check_key(ip, given, token)
+    if result == "wait":
+        wait = _seconds_to_wait(ip)
+        return HTMLResponse(_login_html(error=f"For mange feil nøkler. Vent {wait} sekunder og prøv igjen."),
+                            status_code=429, headers={**NO_STORE, "Retry-After": str(wait)})
+    if result == "wrong":
+        return HTMLResponse(_login_html(error="Feil nøkkel. Prøv igjen."), status_code=401, headers=NO_STORE)
 
     response = RedirectResponse("/dashboard", status_code=303)
     is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
@@ -538,6 +643,20 @@ def _login_html(error: str = "") -> str:
     error_html = f'<p class="error" role="alert">{error}</p>' if error else ""
     return _PAGE.format(body=_LOGIN_BODY.format(error=error_html))
 
+
+WRONG_HOST_TEXT = (
+    "Dashboardet svarer bare på localhost, en IP-adresse, navn som slutter på .local "
+    "eller navn i DASHBOARD_ALLOWED_HOSTS i .hevy_env."
+)
+
+WRONG_HOST_HTML = _PAGE.format(body="""
+<h1>Ukjent adresse</h1>
+<p>Dashboardet ble åpnet med et navn det ikke kjenner igjen. Det er en beskyttelse mot
+nettsider som prøver å lure nettleseren til å lese dashboardet ditt.</p>
+<p>Bruk <code>http://localhost:8000/dashboard</code> eller Pi-ens IP-adresse. Vil du bruke et eget navn,
+for eksempel <code>pi.hjemme</code>, legger du det til i <code>.hevy_env</code>:<br>
+<code>DASHBOARD_ALLOWED_HOSTS=pi.hjemme</code></p>
+""")
 
 NO_TOKEN_HTML = _PAGE.format(body="""
 <h1>Dashboardet er låst</h1>
