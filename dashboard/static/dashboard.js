@@ -708,7 +708,9 @@
         if (last) s += '<text class="val-sm" x="' + xx(i).toFixed(1) + '" y="' + (yy(v) - 9).toFixed(1) + '" text-anchor="middle">' + fmtV(v) + '</text>';
       });
     }
+    var every = slot < 28 ? 2 : 1;
     hist.forEach(function (h, i) {
+      if ((n - 1 - i) % every) return;
       var d = parseDate(h.date);
       s += '<text class="axis" x="' + (i * slot + slot / 2).toFixed(1) + '" y="' + (H - 3) + '" text-anchor="middle">' + WD_SHORT[d.getDay()] + '</text>';
     });

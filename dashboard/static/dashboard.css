@@ -600,7 +600,12 @@ path[data-tip]:hover { opacity: .85; }
   .page { padding: 0 16px 32px; }
   .hero__panel { padding: 24px; }
   .hero__status { font-size: 15px; }
-  .quote__text p { font-size: 18px; }
+  .hero__quote { padding: 16px; }
+  .quote__mark { display: none; }
+  .quote__label { margin-bottom: 8px; }
+  .quote__text p { font-size: 16px; }
+  .quote__author { margin-top: 8px; }
+  .comeback__art svg { width: 56px; height: 56px; }
   .comeback { grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 16px; }
   .comeback__art svg { width: 64px; height: 64px; }
   .comeback__title { font-size: 20px; }
