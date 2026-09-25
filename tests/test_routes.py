@@ -352,7 +352,6 @@ def test_cross_site_login_is_refused(client, with_token):
 def with_token(monkeypatch):
     from dashboard import routes
     monkeypatch.setenv("DASHBOARD_TOKEN", TOKEN)
-    monkeypatch.setattr(routes, "LOGIN_FAIL_DELAY", 0)
 
 
 def test_token_flow(client, simple_template, with_token):
@@ -517,22 +516,128 @@ def test_access_log_filter_masks_other_secrets(text, secret):
     assert "***" in record.getMessage()
 
 
-def test_failed_logins_are_answered_one_at_a_time(app, with_token, monkeypatch):
+def test_wrong_keys_are_braked_per_ip(app, with_token):
     from dashboard import routes
-    monkeypatch.setattr(routes, "LOGIN_FAIL_DELAY", 0.2)
+    client = TestClient(app)                                   # address "testclient"
+    for _ in range(routes.FREE_TRIES):
+        assert client.post("/dashboard/login", data={"token": "wrong"}).status_code == 401
+    resp = client.post("/dashboard/login", data={"token": "wrong"})
+    assert resp.status_code == 429
+    assert int(resp.headers["retry-after"]) >= 1
+    assert "Vent" in resp.text
+    # Even the right key must wait now…
+    assert client.post("/dashboard/login", data={"token": TOKEN}, follow_redirects=False).status_code == 429
+    # …but someone on another address (you, on your phone) is not affected
+    other = TestClient(app, client=("10.0.0.9", 50000))
+    assert other.post("/dashboard/login", data={"token": TOKEN}, follow_redirects=False).status_code == 303
+    # When the wait is over, the right key works and the counter is reset
+    count, last = routes._failed_tries["testclient"]
+    routes._failed_tries["testclient"] = (count, last - routes.MAX_WAIT_SECONDS - 1)
+    assert client.post("/dashboard/login", data={"token": TOKEN}, follow_redirects=False).status_code == 303
+    assert "testclient" not in routes._failed_tries
 
-    async def three_wrong_guesses_at_once():
-        routes._login_lock = asyncio.Lock()
-        transport = httpx.ASGITransport(app=app)
+
+def test_brake_counts_parallel_guesses(app, with_token):
+    """Many guesses at the same moment are still counted one by one."""
+    from dashboard import routes
+
+    async def ten_at_once():
+        transport = httpx.ASGITransport(app=app)   # client address 127.0.0.1
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
-            start = time.monotonic()
-            answers = await asyncio.gather(*[
-                ac.post("/dashboard/login", data={"token": f"guess{i}"}) for i in range(3)])
-            return time.monotonic() - start, [a.status_code for a in answers]
+            answers = await asyncio.gather(*[ac.post("/dashboard/login", data={"token": f"g{i}"})
+                                             for i in range(10)])
+        return sorted(a.status_code for a in answers)
 
-    elapsed, codes = asyncio.run(three_wrong_guesses_at_once())
-    assert codes == [401, 401, 401]
-    assert elapsed >= 0.55   # 3 × 0.2 s one after another, not 0.2 s in parallel
+    assert asyncio.run(ten_at_once()) == [401] * routes.FREE_TRIES + [429] * (10 - routes.FREE_TRIES)
+
+
+def test_bearer_is_braked_too(client, with_token):
+    from dashboard import routes
+    for _ in range(routes.FREE_TRIES):
+        assert client.get("/dashboard/api", headers={"Authorization": "Bearer nope"}).status_code == 401
+    resp = client.get("/dashboard/api", headers={"Authorization": "Bearer nope"})
+    assert resp.status_code == 429 and "retry-after" in resp.headers
+    assert client.get("/dashboard/api", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 429
+
+
+def test_wait_grows_and_has_a_ceiling():
+    from dashboard import routes
+    now = time.monotonic()
+    waits = []
+    for count in (3, 4, 5, 20):
+        routes._failed_tries["x"] = (count, now)
+        waits.append(routes._seconds_to_wait("x"))
+    routes._failed_tries.clear()
+    assert waits[0] == 2 and waits[1] == 4 and waits[2] == 8 and waits[3] == routes.MAX_WAIT_SECONDS
+
+
+def test_login_body_is_limited(client, with_token):
+    big = b"token=" + b"a" * 5000
+    resp = client.post("/dashboard/login", content=big,
+                       headers={"content-type": "application/x-www-form-urlencoded"})
+    assert resp.status_code == 413
+
+    def chunks():   # no Content-Length: the server must stop reading by itself
+        for _ in range(10):
+            yield b"a" * 1000
+
+    resp = client.post("/dashboard/login", content=chunks(),
+                       headers={"content-type": "application/x-www-form-urlencoded"})
+    assert resp.status_code == 413
+
+
+# ─── DNS rebinding: unknown host names are refused when access is by IP ───
+
+@pytest.mark.parametrize("base_url", ["http://evil.example", "http://rebind.attacker.example:8000",
+                                      "http://127.0.0.1.evil.example"])
+def test_unknown_host_name_is_refused(app, no_demo, base_url, tmp_path):
+    client = TestClient(app, client=("127.0.0.1", 50000), base_url=base_url)
+    resp = client.get("/dashboard/api")
+    assert resp.status_code == 403
+    assert "DASHBOARD_ALLOWED_HOSTS" in resp.json()["error"]
+    resp = client.get("/dashboard")
+    assert resp.status_code == 403 and "DASHBOARD_ALLOWED_HOSTS" in resp.text
+    origin = base_url
+    resp = client.post("/dashboard/weight", json={"kg": 150},
+                       headers={"Origin": origin, "Sec-Fetch-Site": "same-origin"})
+    assert resp.status_code == 403
+    assert not (tmp_path / "weights.json").exists()   # nothing written to disk
+
+
+def test_unknown_host_name_is_refused_in_demo_too(app):
+    client = TestClient(app, base_url="http://evil.example")
+    assert client.get("/dashboard/api").status_code == 403
+
+
+@pytest.mark.parametrize("base_url, allowed_hosts", [
+    ("http://localhost:8000", ""),
+    ("http://127.0.0.1:8000", ""),
+    ("http://192.168.1.20:8000", ""),
+    ("http://fitcoach.local:8000", ""),
+    ("http://pi.hjemme:8000", "pi.hjemme"),
+    ("http://PI.Hjemme:8000", " fitcoach.lan , pi.hjemme "),
+])
+def test_known_host_names_are_allowed(app, no_demo, monkeypatch, base_url, allowed_hosts):
+    monkeypatch.setenv("DASHBOARD_ALLOWED_HOSTS", allowed_hosts)
+    client = TestClient(app, client=("192.168.1.30", 50000), base_url=base_url)
+    assert client.get("/dashboard/api").status_code == 200
+
+
+@pytest.mark.parametrize("host, ok", [("[::1]:8000", True), ("[fe80::1]", True), ("evil.example:8000", False)])
+def test_host_name_check_ipv6(monkeypatch, host, ok):
+    """TestClient can't use IPv6 base URLs, so this checks the helper directly."""
+    from starlette.requests import Request
+    from dashboard import routes
+    monkeypatch.delenv("DASHBOARD_ALLOWED_HOSTS", raising=False)
+    scope = {"type": "http", "method": "GET", "path": "/", "query_string": b"", "scheme": "http",
+             "server": ("127.0.0.1", 8000), "headers": [(b"host", host.encode())]}
+    assert routes._host_name_allowed(Request(scope)) is ok
+
+
+def test_host_check_does_not_apply_with_token(app, with_token):
+    """With DASHBOARD_TOKEN the key protects us, so any host name (e.g. the ngrok name) works."""
+    client = TestClient(app, base_url="https://abc.ngrok-free.app")
+    assert client.get("/dashboard/api", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 200
 
 
 def test_changing_the_token_logs_everyone_out(client, with_token, monkeypatch):
@@ -890,22 +995,185 @@ def test_garmin_error_is_cached_for_20_minutes(monkeypatch, garmin_env):
     assert len(calls) == 3
 
 
-def test_given_up_job_does_not_save_its_client(monkeypatch, garmin_env):
-    """If a failure was handled while a job was logging in, the job must not store its client."""
+def test_new_login_is_only_kept_through_the_job_result(monkeypatch, garmin_env):
+    """The thread puts a new login in its job box; only fetch_garmin_days saves it."""
     from dashboard import sources
-
-    def login_while_error_is_handled():
-        sources._garmin_generation += 1   # as if a failed job had been handled meanwhile
-        return FakeGarmin()
-
-    monkeypatch.setattr(sources, "_garmin_login", login_while_error_is_handled)
-    sources._fetch_garmin_days_sync(1, date(2026, 9, 24))
-    assert sources._garmin_client is None
-
-    # Normal case: the client is kept for the next fetch
     monkeypatch.setattr(sources, "_garmin_login", lambda: FakeGarmin())
-    sources._fetch_garmin_days_sync(1, date(2026, 9, 24))
-    assert isinstance(sources._garmin_client, FakeGarmin)
+
+    box = {}
+    sources._run_garmin_job(1, date(2026, 9, 24), box)
+    assert isinstance(box["client"], FakeGarmin)
+    assert sources._garmin_client is None          # the thread did not touch it
+
+    asyncio.run(sources.fetch_garmin_days(1, today=date(2026, 9, 24)))
+    assert isinstance(sources._garmin_client, FakeGarmin)   # saved from the finished job
+
+
+def test_garmin_shows_last_good_data_when_busy_or_failing(monkeypatch, garmin_env):
+    from dashboard import sources
+    good = [sources.empty_garmin_day("2026-09-24") | {"steps": 5000}]
+    mode = {"fail": False}
+
+    def job(days, today):
+        if mode["fail"]:
+            raise RuntimeError("boom")
+        return good
+
+    monkeypatch.setattr(sources, "_fetch_garmin_days_sync", job)
+    assert asyncio.run(sources.fetch_garmin_days(1, today=date(2026, 9, 24))) == good
+
+    # Garmin breaks, data is 10 min old → the old data is returned quietly
+    mode["fail"] = True
+    sources._garmin_cache["fetched_at"] -= 10 * 60
+    assert asyncio.run(sources.fetch_garmin_days(1, force=True, today=date(2026, 9, 24))) == good
+
+    # Data is 40 min old → GarminError, but with the old data and its age attached
+    sources._garmin_cache["fetched_at"] -= 30 * 60
+    with pytest.raises(sources.GarminError) as info:
+        asyncio.run(sources.fetch_garmin_days(1, force=True, today=date(2026, 9, 24)))
+    assert info.value.stale_days == good and info.value.stale_minutes == 40
+
+    # Older than 24 hours → no data at all
+    sources._garmin_cache["fetched_at"] -= 24 * 3600
+    with pytest.raises(sources.GarminError) as info:
+        asyncio.run(sources.fetch_garmin_days(1, force=True, today=date(2026, 9, 24)))
+    assert info.value.stale_days is None
+
+
+def test_page_uses_stale_garmin_data_with_a_note(local_client, monkeypatch, garmin_env):
+    from dashboard import sources
+    monkeypatch.delenv("FITCOACH_DEMO")
+    stale = [sources.empty_garmin_day("2026-09-24") | {"steps": 5000}]
+
+    async def empty(*args, **kwargs):
+        return []
+
+    async def no_muscles(*args, **kwargs):
+        return {}
+
+    async def garmin(*args, **kwargs):
+        raise sources.GarminError("Garmin svarte ikke.", stale_days=stale, stale_minutes=125)
+
+    monkeypatch.setattr(sources, "fetch_all_workouts", empty)
+    monkeypatch.setattr(sources, "fetch_template_muscles", no_muscles)
+    monkeypatch.setattr(sources, "fetch_garmin_days", garmin)
+    monkeypatch.setitem(sys.modules, "dashboard.analytics", types.SimpleNamespace(
+        build_dashboard=lambda **kw: {"sources": kw["sources"], "garmin_days": kw["garmin_days"]}))
+
+    data = local_client.get("/dashboard/api").json()
+    assert data["garmin_days"] == stale
+    assert data["sources"]["garmin"] == "ok"
+    assert "Garmin svarte ikke." in data["sources"]["errors"]
+    assert "Viser Garmin-data fra 2 timer og 5 minutter siden." in data["sources"]["errors"]
+
+
+def test_hung_garmin_job_is_given_up_after_10_minutes(monkeypatch, garmin_env):
+    from dashboard import sources
+    calls = []
+    release = threading.Event()
+
+    def hang(days, today):
+        calls.append(1)
+        release.wait(5)
+        return []
+
+    monkeypatch.setattr(sources, "_fetch_garmin_days_sync", hang)
+    monkeypatch.setattr(sources, "GARMIN_TIMEOUT_SECONDS", 0.05)
+
+    async def scenario():
+        with pytest.raises(sources.GarminError, match="svarte ikke"):
+            await sources.fetch_garmin_days(1, force=True, today=date(2026, 9, 24))
+        with pytest.raises(sources.GarminError, match="holder fortsatt på"):
+            await sources.fetch_garmin_days(1, force=True, today=date(2026, 9, 24))
+        assert len(calls) == 1
+        sources._garmin_task_started -= sources.GARMIN_TASK_MAX_SECONDS + 1   # pretend 10 min passed
+        with pytest.raises(sources.GarminError):
+            await sources.fetch_garmin_days(1, force=True, today=date(2026, 9, 24))
+        assert len(calls) == 2   # the hung job was given up and a new one started
+        release.set()
+        await asyncio.sleep(0.1)
+
+    asyncio.run(scenario())
+
+
+def test_password_login_keeps_tokenstore_for_refreshed_tokens(monkeypatch, garmin_env, tmp_path):
+    import garminconnect
+    from dashboard import sources
+    dumped = []
+
+    class InnerClient:
+        _tokenstore_path = None
+
+        def dump(self, path):
+            dumped.append(path)
+
+    class PasswordOnlyGarmin:
+        def __init__(self, email=None, password=None, **kwargs):
+            self.client = InnerClient()
+            self.email = email
+
+        def login(self, tokenstore=None):
+            if tokenstore or not self.email:
+                raise FileNotFoundError("no tokens")
+
+    monkeypatch.setattr(garminconnect, "Garmin", PasswordOnlyGarmin)
+    monkeypatch.setenv("GARMIN_TOKENSTORE", str(tmp_path / "tokens"))
+    client = sources._garmin_login()
+    assert client.client._tokenstore_path == str(tmp_path / "tokens")
+    assert dumped == [str(tmp_path / "tokens")]
+
+
+def test_hevy_errors_are_cached_for_2_minutes(monkeypatch, tmp_path):
+    from dashboard import sources
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(500)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(sources.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(sources, "MUSCLES_CACHE_PATH", tmp_path / "muscles.json")
+    monkeypatch.setattr(sources, "_muscles_memory", {})
+
+    for _ in range(3):
+        with pytest.raises(Exception):
+            asyncio.run(sources.fetch_all_workouts("k"))
+        with pytest.raises(Exception):
+            asyncio.run(sources.fetch_template_muscles("k"))
+    assert calls == ["/v1/workouts", "/v1/exercise_templates"]   # asked once each, not 3 times
+
+    # The "Oppdater" button (force) asks HEVY again for workouts
+    with pytest.raises(Exception):
+        asyncio.run(sources.fetch_all_workouts("k", force=True))
+    assert calls.count("/v1/workouts") == 2
+
+    # After 2 minutes HEVY is asked again
+    sources._workouts_cache["error_at"] -= sources.HEVY_ERROR_TTL_SECONDS + 1
+    sources._muscles_error["at"] -= sources.HEVY_ERROR_TTL_SECONDS + 1
+    with pytest.raises(Exception):
+        asyncio.run(sources.fetch_all_workouts("k"))
+    with pytest.raises(Exception):
+        asyncio.run(sources.fetch_template_muscles("k"))
+    assert calls.count("/v1/workouts") == 3 and calls.count("/v1/exercise_templates") == 2
+
+
+def test_old_muscle_file_is_used_while_hevy_is_down(monkeypatch, tmp_path):
+    import os as _os
+    from dashboard import sources
+    old = tmp_path / "muscles.json"
+    old.write_text(json.dumps({"OLD": "chest"}))
+    week_ago = time.time() - 8 * 24 * 3600
+    _os.utime(old, (week_ago, week_ago))
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(sources.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(lambda r: httpx.Response(500)), **kw))
+    monkeypatch.setattr(sources, "MUSCLES_CACHE_PATH", old)
+    monkeypatch.setattr(sources, "_muscles_memory", {})
+    assert asyncio.run(sources.fetch_template_muscles("k")) == {"OLD": "chest"}
+    assert asyncio.run(sources.fetch_template_muscles("k")) == {"OLD": "chest"}   # during the 2 min pause
 
 
 def test_garmin_days_are_fetched_at_most_4_at_a_time(monkeypatch, garmin_env):

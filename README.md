@@ -50,8 +50,31 @@ The proxy also serves a live dashboard with your training, recovery and weight. 
 
 Start the proxy as usual (`uvicorn hevy_proxy:app --port 8000`) and open:
 
-- on the Pi itself or another device on your home network: <http://localhost:8000/dashboard> (or the Pi's local IP, e.g. `http://192.168.1.20:8000/dashboard`)
+- on the Pi itself: <http://localhost:8000/dashboard>
 - from anywhere (your phone on 4G): `https://<your-ngrok-address>/dashboard`. This needs `DASHBOARD_TOKEN`, see below.
+- from another device on your home network: see the next section. It needs one extra setting.
+
+#### From another device on your home network
+
+By default uvicorn only listens on `127.0.0.1`, so only the Pi itself can connect (ngrok also runs on the Pi, so it still works). The systemd service in `HEVY_API_Instructions.txt` does the same. To reach the dashboard from your laptop or phone at home, e.g. `http://192.168.1.20:8000/dashboard`, uvicorn must listen on all network cards with `--host 0.0.0.0`:
+
+```sh
+uvicorn hevy_proxy:app --host 0.0.0.0 --port 8000
+```
+
+and in the systemd service file:
+
+```
+ExecStart=/home/<YOUR_PI_USER>/FitCoach/.env/bin/uvicorn hevy_proxy:app --host 0.0.0.0 --port 8000
+```
+
+**Be aware:** this makes the whole proxy reachable on your home network, including the GPT endpoints (`/workouts`), which can read and log workouts with your HEVY key and have no password. Only do this on a network you trust. Without `--host 0.0.0.0`, everything stays on the Pi and is reachable from outside only through ngrok.
+
+Open the dashboard with the Pi's IP address or a name ending in `.local` (e.g. `http://raspberrypi.local:8000/dashboard`). If you use another name, for example `pi.hjemme` from your router, add it to `.hevy_env`, otherwise the dashboard answers "Ukjent adresse" (see the next section for why):
+
+```
+DASHBOARD_ALLOWED_HOSTS=pi.hjemme
+```
 
 The page caches data, so reloading is cheap: HEVY workouts are kept for 10 minutes and Garmin data for 30 minutes. The **Oppdater** button fetches fresh data.
 
@@ -61,9 +84,11 @@ Your ngrok address is public, so the dashboard is locked down by default:
 
 | | Without `DASHBOARD_TOKEN` | With `DASHBOARD_TOKEN` |
 |---|---|---|
-| On the Pi / home network (direct) | Open | Log in once |
+| On the Pi / home network (direct, known host name; home network needs `--host 0.0.0.0`) | Open | Log in once |
 | Through ngrok (internet) | Refused (the page explains how to set a token) | Log in once |
 | Demo mode (`FITCOACH_DEMO`) | Open (only made-up data) | Log in once |
+
+Without a token (and in demo mode) there is one more rule: the address in the browser must be `localhost`, an IP address, a name ending in `.local`, or a name listed in `DASHBOARD_ALLOWED_HOSTS` (comma-separated). This stops a trick called *DNS rebinding*, where a bad website points its own name at your Pi and reads the dashboard through your browser. Other names get *403 Ukjent adresse*. With `DASHBOARD_TOKEN` set, this rule is not needed and any name works.
 
 "Direct" means the request comes from `127.0.0.1`, `::1` or a private home network (`10.x`, `172.16–31.x`, `192.168.x`) **and** has none of the headers that proxies and tunnels add (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `Forwarded`, `X-Real-IP`, `Via`, `CF-Connecting-IP`, `True-Client-IP`, `X-Client-IP`). ngrok always adds some of them, so requests through ngrok never count as local.
 
@@ -81,7 +106,7 @@ Other websites can't use your browser to change anything: saving a weigh-in only
    ```
 3. Open `/dashboard`. You are sent to a small login page (`/dashboard/login`). Paste the key and press **Logg inn**. The browser gets a login cookie that lasts 90 days.
 
-The key is sent in the form (the request body), never in the address, so it stays out of uvicorn's access log and your browser history. Old links like `/dashboard?key=…` no longer log you in, and secrets such as `key=`, `token=`, `password=` or an `Authorization` value are shown as `***` in the access log. Wrong keys are answered one at a time with a 1-second pause, which makes guessing slow.
+The key is sent in the form (the request body), never in the address, so it stays out of uvicorn's access log and your browser history. Old links like `/dashboard?key=…` no longer log you in, and secrets such as `key=`, `token=`, `password=` or an `Authorization` value are shown as `***` in the access log. Wrong keys are slowed down per IP address (both in the login form and with `Authorization: Bearer`): the first 3 wrong keys are free (typos happen), then that address must wait 2, 4, 8 … seconds (at most 5 minutes) between tries and gets *429 Too Many Requests* until then. Other addresses are not affected, so a stranger can't lock you out. Be honest with yourself about the limits: someone with many IP addresses is not stopped by this. The real protection is that the key is long and random.
 
 **The ngrok inspector can still see it.** ngrok's local web inspector (<http://127.0.0.1:4040> on the Pi) records full requests, including the login form body, the cookie and `Authorization` headers. Only people with access to the Pi can open it, but you can turn it off by adding `inspect: false` to the tunnel in your ngrok config (`ngrok config edit`), for example:
 
@@ -122,8 +147,11 @@ Without `GARMIN_EMAIL` and `GARMIN_PASSWORD`, the dashboard simply shows "Garmin
 
 To protect your Garmin account, the dashboard is careful:
 
-- Only one Garmin download runs at a time. It fetches up to 4 days at once. If it takes longer than 45 seconds, the page loads without Garmin data while the download finishes in the background, and the next page load uses the result. While it runs, no new download is started, not even with **Oppdater**.
+- Only one Garmin download runs at a time. It fetches up to 4 days at once. If it takes longer than 45 seconds, the page stops waiting while the download finishes in the background, and the next page load uses the result. While it runs, no new download is started, not even with **Oppdater**. A download that hangs for more than 10 minutes is given up, so a new one can start.
 - After a Garmin error it waits 20 minutes before asking Garmin again (unless you press **Oppdater**).
+- While Garmin is busy or failing, the page shows the last good Garmin data. If that data is more than 30 minutes old, the page says how old it is (for example "Viser Garmin-data fra 2 timer og 5 minutter siden."). Data older than 24 hours is not shown.
+
+HEVY errors are remembered for 2 minutes too, so a HEVY outage doesn't mean a new download attempt on every page load. **Oppdater** tries again straight away.
 - If a login with your e-mail and password fails (wrong password, MFA, "too many requests"), it does **not** try the password again by itself, because repeated attempts can send MFA e-mails or lock the account. The saved tokens are still tried. Press **Oppdater** or restart the proxy to allow one new password login. **Oppdater** can do this at most once every 10 minutes. If MFA is the problem, run `python -m dashboard.sources` again.
 
 ### Weigh-ins
@@ -147,6 +175,7 @@ Then open <http://localhost:8000/dashboard>. All data is synthetic. `FITCOACH_DE
 | `DASHBOARD_TOKEN` | *(none)* | Access key for the dashboard. Without it, only direct local requests get in (see above) |
 | `DASHBOARD_NAME` | *(empty)* | Your name in the greeting, e.g. `Håkon` |
 | `DASHBOARD_TZ` | `Europe/Oslo` | Time zone used for "today" and the greeting |
+| `DASHBOARD_ALLOWED_HOSTS` | *(empty)* | Extra host names allowed without a token, comma-separated (e.g. `pi.hjemme`) |
 | `WEIGHTS_PATH` | `weights.json` | Where weigh-ins are stored (not used in demo mode) |
 | `GARMIN_TOKENSTORE` | `~/.garminconnect` | Where Garmin login tokens are stored |
 | `FITCOACH_DEMO` | *(off)* | `1` or `comeback` for demo data |

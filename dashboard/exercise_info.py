@@ -122,17 +122,17 @@ EXERCISES = {
                "Da jobber magemusklene og ikke bare hoftebøyerne.",
     },
     "Dead Hang": {
-        "label": "Heng i stang", "muscle": "forearms", "equipment": "bodyweight",
+        "label": "Heng i stang", "muscle": "forearms", "equipment": "bodyweight", "timed": True,
         "cue": "Heng passivt med avslappede skuldre. Det styrker grepet og avlaster "
                "ryggraden, noe som er fint etter en dag med babybæring.",
     },
     "Single Leg Standing Calf Raise": {
         "label": "Ettbeins tåhev", "muscle": "calves", "equipment": "bodyweight",
         "cue": "Gå helt ned for strekk og helt opp på tå, med en liten pause på toppen. "
-               "Leggene svarer godt på full bevegelsesbane og mange reps.",
+               "Leggene svarer godt på full bevegelsesbane og mange repetisjoner.",
     },
     "Incline Chest Fly (Dumbbell)": {
-        "label": "Skrå flyes med manualer", "muscle": "chest", "equipment": "dumbbell",
+        "label": "Brystflyes på skråbenk", "muscle": "chest", "equipment": "dumbbell",
         "cue": "Ha lett bøy i albuene og åpne armene til du kjenner strekk over brystet. "
                "Skrå benk flytter mer av jobben til øvre del av brystet.",
     },
@@ -142,17 +142,32 @@ EXERCISES = {
     },
     # Common extras, so other logged exercises also get a Norwegian name.
     "Deadlift (Barbell)": {"label": "Markløft med stang", "muscle": "lower_back", "equipment": "barbell"},
-    "Overhead Press (Barbell)": {"label": "Skulderpress med stang", "muscle": "shoulders", "equipment": "barbell"},
+    "Overhead Press (Barbell)": {
+        "label": "Skulderpress med stang", "muscle": "shoulders", "equipment": "barbell",
+        "cue": "Stangen starter på kragebeinet og går rett opp forbi ansiktet. Z-stangen gir 2,5 kg-steg, "
+               "så du kan øke jevnt der manualene hopper.",
+    },
     "Hip Thrust (Barbell)": {"label": "Hoftehev med stang", "muscle": "glutes", "equipment": "barbell"},
     "Bicep Curl (Dumbbell)": {"label": "Bicepscurl med manualer", "muscle": "biceps", "equipment": "dumbbell"},
     "Hammer Curl (Dumbbell)": {"label": "Hammercurl", "muscle": "biceps", "equipment": "dumbbell"},
     "Triceps Extension (Dumbbell)": {"label": "Tricepsekstensjon med manual", "muscle": "triceps", "equipment": "dumbbell"},
     "Lateral Raise (Dumbbell)": {"label": "Sidehev med manualer", "muscle": "shoulders", "equipment": "dumbbell"},
-    "Bulgarian Split Squat": {"label": "Bulgarsk utfall", "muscle": "quadriceps", "equipment": "bodyweight"},
-    "Pull Up": {"label": "Pull-ups", "muscle": "lats", "equipment": "bodyweight"},
-    "Chin Up": {"label": "Chin-ups", "muscle": "lats", "equipment": "bodyweight"},
-    "Plank": {"label": "Planke", "muscle": "abdominals", "equipment": "bodyweight"},
-    "Crunch": {"label": "Crunches", "muscle": "abdominals", "equipment": "bodyweight"},
+    "Bulgarian Split Squat": {
+        "label": "Bulgarsk utfall", "muscle": "quadriceps", "equipment": "bodyweight",
+        "cue": "Bakre fot på benken, og senk deg rett ned. Ett bein om gangen gir mye belastning uten tung vekt.",
+    },
+    "Hanging Leg Raise": {
+        "label": "Hengende beinløft", "muscle": "abdominals", "equipment": "bodyweight",
+        "cue": "Løft strake bein med kontroll og rull bekkenet opp i toppen. Tyngre enn kneløft fordi "
+               "beina gir en lengre vektarm.",
+    },
+    "Pull Up": {"label": "Pullups", "muscle": "lats", "equipment": "bodyweight"},
+    "Chin Up": {"label": "Chins", "muscle": "lats", "equipment": "bodyweight"},
+    "Plank": {
+        "label": "Planke", "muscle": "abdominals", "equipment": "bodyweight", "timed": True,
+        "cue": "Stram setet og press albuene mot tærne. Planken trener musklene som holder ryggraden stabil.",
+    },
+    "Crunch": {"label": "Magecurl", "muscle": "abdominals", "equipment": "bodyweight"},
     "Walking": {"label": "Gange", "muscle": "cardio", "equipment": "cardio"},
 }
 
@@ -416,22 +431,42 @@ def deload_weight(title, kg, factor, floor_pct=0.55, ceiling_pct=0.8):
     kind = load_kind(title)
     if kg is None or kg <= 0 or factor is None or kind is None:
         return None
+    low, high, target = kg * floor_pct, kg * ceiling_pct, kg * factor
+    cap = weight_cap(title)
+    if cap is not None:
+        high = min(high, cap)
     if kind == "dumbbell":
         options = [float(d) for d in DUMBBELLS_KG]
     else:
+        # Only the two 2.5 kg steps around the target and the step at the ceiling can win,
+        # so we never build a long list (safe even for a typo like 20 000 000 kg).
         minimum = BARBELL_MIN_KG if kind == "barbell" else BARBELL_STEP_KG
-        options = [minimum + i * BARBELL_STEP_KG for i in range(int((kg - minimum) / BARBELL_STEP_KG) + 1)]
-    cap = weight_cap(title)
-    if cap is not None:
-        options = [o for o in options if o <= cap]
-    target = kg * factor
-    in_window = [o for o in options if kg * floor_pct - 1e-9 <= o <= kg * ceiling_pct + 1e-9]
+        below = _step_floor(target)
+        options = [o for o in (below, below + BARBELL_STEP_KG, _step_floor(high)) if o >= minimum]
+    in_window = [o for o in options if low - 1e-9 <= o <= high + 1e-9]
     if in_window:
         return min(in_window, key=lambda o: (abs(o - target), o))
-    below = [o for o in options if o <= kg * ceiling_pct + 1e-9]
-    if below:
-        return max(below)
+    under = [o for o in options if o <= high + 1e-9]
+    if under:
+        return max(under)
     return next_weight_down(title, kg) or kg
+
+
+def is_timed(title):
+    """True for exercises measured in seconds (Dead Hang, Plank)."""
+    info = _known(title)
+    if info:
+        return bool(info.get("timed"))
+    lower = _clean(title).lower()
+    return "plank" in lower or "hang" in lower or "hold" in lower
+
+
+def is_running(title):
+    """True for running titles (Running, Treadmill, Trail Running …) – not walking or cycling."""
+    lower = _clean(title).lower()
+    if "walk" in lower:
+        return False
+    return any(word in lower for word in ("run", "treadmill", "jog", "løp"))
 
 
 def max_available(title):
