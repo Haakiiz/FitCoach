@@ -13,7 +13,9 @@ import json
 import logging
 import math
 import os
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -36,12 +38,16 @@ def _write_json_atomic(path: Path, data) -> None:
 
     We first write to a temporary file and then rename it over the real file.
     A rename is "atomic": if the Pi loses power halfway, you get either the old
-    file or the new one, never a half-written file.
+    file or the new one, never a half-written file. flush + fsync make sure the
+    new content is really on the SD card before the rename.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp_path, path)
 
 
@@ -201,17 +207,31 @@ async def _fetch_template_muscles(api_key: str) -> dict[str, str]:
 
 GARMIN_TTL_SECONDS = 30 * 60        # keep Garmin data for 30 minutes
 GARMIN_ERROR_TTL_SECONDS = 20 * 60  # after a failure, wait 20 minutes before trying again
-GARMIN_TIMEOUT_SECONDS = 25         # give up if Garmin has not answered within 25 seconds
+GARMIN_TIMEOUT_SECONDS = 45         # the page stops waiting for Garmin after 45 seconds
+GARMIN_WORKERS = 4                  # how many days are fetched at the same time
+PASSWORD_RETRY_SECONDS = 10 * 60    # "Oppdater" may allow a new password login once per 10 min
 
-_garmin_cache = {"fetched_at": 0.0, "key": None, "days": None, "error": None, "error_at": 0.0}
+_garmin_cache = {"fetched_at": 0.0, "key": None, "days": None,
+                 "error": None, "error_at": 0.0, "error_is_login": False}
 _garmin_lock = asyncio.Lock()
 _garmin_client = None               # the logged-in Garmin client, reused between fetches
 
+# The one background job that talks to Garmin (None when nothing is running).
+# There is never more than one: while it runs, nobody starts another.
+_garmin_task = None
+_garmin_task_key = None
+
+# Bumped every time a failed job has been handled. A job only saves its
+# logged-in client if the number has not changed since the job started.
+_garmin_generation = 0
+
 # After a failed e-mail/password login we do NOT try the password again by
 # ourselves: repeated attempts can trigger MFA e-mails, "429 Too Many Requests"
-# or even lock the account. It is unlocked by ?refresh=1 (the "Oppdater" button)
-# or by restarting the proxy. Saved tokens are still tried every time.
+# or even lock the account. "Oppdater" (?refresh=1) can unlock it, but at most
+# once per 10 minutes. Restarting the proxy also unlocks it. Saved tokens are
+# still tried every time.
 _password_login_blocked = False
+_password_unblocked_at = float("-inf")
 
 
 class GarminError(Exception):
@@ -397,36 +417,48 @@ def _runs_by_date(activities) -> dict[str, list[dict]]:
     return runs
 
 
+def _fetch_one_day(client, ds: str, bb_entry, runs: list) -> dict:
+    """Fetch and normalise one Garmin day (5 small API calls)."""
+    day = empty_garmin_day(ds)
+    _fill_day(
+        day,
+        sleep=_safe("sleep", client.get_sleep_data, ds),
+        stats=_safe("stats", client.get_stats, ds),
+        hrv=_safe("hrv", client.get_hrv_data, ds),
+        spo2=_safe("spo2", client.get_spo2_data, ds),
+        resp=_safe("respiration", client.get_respiration_data, ds),
+        bb_entry=bb_entry,
+    )
+    day["runs"] = runs
+    return day
+
+
 def _fetch_garmin_days_sync(days: int, today: date) -> list[dict]:
     """The slow, blocking part of fetch_garmin_days (runs in a background thread)."""
     global _garmin_client
-    if _garmin_client is None:
-        _garmin_client = _garmin_login()
+    generation = _garmin_generation
     client = _garmin_client
+    if client is None:
+        client = _garmin_login()
+        if generation == _garmin_generation:   # nobody has given up on this job meanwhile
+            _garmin_client = client
 
     first = today - timedelta(days=days - 1)
     first_s, today_s = first.isoformat(), today.isoformat()
+    dates = [(first + timedelta(days=i)).isoformat() for i in range(days)]
 
-    # Two range calls cover all days at once
+    # Two range calls cover all days at once. They run first and alone, so an
+    # expiring login token is refreshed once before the parallel calls start.
     bb_list = _safe("body battery", client.get_body_battery, first_s, today_s) or []
     bb_by_date = {e.get("date"): e for e in bb_list if isinstance(e, dict)}
     runs = _runs_by_date(_safe("activities", client.get_activities_by_date, first_s, today_s))
 
-    result = []
-    for i in range(days):
-        ds = (first + timedelta(days=i)).isoformat()
-        day = empty_garmin_day(ds)
-        _fill_day(
-            day,
-            sleep=_safe("sleep", client.get_sleep_data, ds),
-            stats=_safe("stats", client.get_stats, ds),
-            hrv=_safe("hrv", client.get_hrv_data, ds),
-            spo2=_safe("spo2", client.get_spo2_data, ds),
-            resp=_safe("respiration", client.get_respiration_data, ds),
-            bb_entry=bb_by_date.get(ds),
-        )
-        day["runs"] = runs.get(ds, [])
-        result.append(day)
+    # The days themselves: 4 at a time instead of one after another (~35 calls)
+    with ThreadPoolExecutor(max_workers=GARMIN_WORKERS) as pool:
+        result = list(pool.map(
+            lambda ds: _fetch_one_day(client, ds, bb_by_date.get(ds), runs.get(ds, [])),
+            dates,
+        ))
 
     # Not a single number came back? Then the login has probably expired.
     # Raising here makes fetch_garmin_days log in again next time.
@@ -435,13 +467,37 @@ def _fetch_garmin_days_sync(days: int, today: date) -> list[dict]:
     return result   # oldest first, newest last
 
 
-def _garmin_error_message(err: Exception) -> str:
+def _garmin_error_message(err: BaseException) -> str:
     """A Norwegian sentence for the page explaining what went wrong."""
     if isinstance(err, GarminError):
         return str(err)
-    if isinstance(err, (asyncio.TimeoutError, TimeoutError)):
-        return f"Garmin svarte ikke innen {GARMIN_TIMEOUT_SECONDS} sekunder. Vi prøver igjen om litt."
     return f"Klarte ikke å hente data fra Garmin ({type(err).__name__}). Vi prøver igjen om litt."
+
+
+def _collect_finished_garmin_task() -> None:
+    """If the background job has finished, move its result (or error) into the cache."""
+    global _garmin_task, _garmin_client, _garmin_generation
+    task = _garmin_task
+    if task is None or not task.done():
+        return
+    _garmin_task = None
+
+    error = asyncio.CancelledError() if task.cancelled() else task.exception()
+    if error is None:
+        _garmin_cache.update(fetched_at=time.monotonic(), key=_garmin_task_key, days=task.result(),
+                             error=None, error_at=0.0, error_is_login=False)
+        return
+
+    _garmin_generation += 1
+    _garmin_client = None   # log in again next time
+    log.warning("[garmin] fetch failed: %s", type(error).__name__)
+    _garmin_cache.update(error=_garmin_error_message(error), error_at=time.monotonic(),
+                         error_is_login=isinstance(error, GarminLoginError))
+
+
+def _raise_cached_garmin_error():
+    error_class = GarminLoginError if _garmin_cache["error_is_login"] else GarminError
+    raise error_class(_garmin_cache["error"])
 
 
 async def fetch_garmin_days(days: int = 7, force: bool = False, today: date | None = None) -> list[dict] | None:
@@ -451,48 +507,64 @@ async def fetch_garmin_days(days: int = 7, force: bool = False, today: date | No
     - Good data is cached for 30 minutes.
     - A failure raises GarminError (Norwegian message) and is remembered for
       20 minutes, so a broken Garmin does not slow down every page load.
-    - force=True (?refresh=1) skips both caches and allows a new password login.
+    - Only ONE background job talks to Garmin at a time. If it takes longer
+      than 45 s, the page gets a GarminError, the job keeps going, and a later
+      call picks up its result. No new job starts while one is running.
+    - force=True (?refresh=1) skips the caches and may allow a new password
+      login (at most once per 10 minutes).
     """
-    global _garmin_client, _password_login_blocked
+    global _garmin_task, _garmin_task_key, _password_login_blocked, _password_unblocked_at
     if not garmin_configured():
         return None
 
     today = today or date.today()
     key = (days, today.isoformat())
 
-    async with _garmin_lock:   # only one Garmin fetch at a time
+    async with _garmin_lock:
+        _collect_finished_garmin_task()
+        if _garmin_task is not None:
+            raise GarminError("Garmin holder fortsatt på med forrige henting. Last siden på nytt om litt.")
+
         now = time.monotonic()
-        if force:
-            _password_login_blocked = False
-        else:
-            if _garmin_cache["key"] == key and now - _garmin_cache["fetched_at"] < GARMIN_TTL_SECONDS:
+        fresh = _garmin_cache["key"] == key and now - _garmin_cache["fetched_at"] < GARMIN_TTL_SECONDS
+        if not force:
+            if fresh:
                 return _garmin_cache["days"]
             if _garmin_cache["error"] and now - _garmin_cache["error_at"] < GARMIN_ERROR_TTL_SECONDS:
-                raise GarminError(_garmin_cache["error"])
+                _raise_cached_garmin_error()
+        elif _password_login_blocked and now - _password_unblocked_at >= PASSWORD_RETRY_SECONDS:
+            _password_login_blocked = False
+            _password_unblocked_at = now
 
+        # Start the background job. garminconnect is not async, so it runs in a thread.
+        _garmin_task = asyncio.ensure_future(asyncio.to_thread(_fetch_garmin_days_sync, days, today))
+        _garmin_task_key = key
         try:
-            # garminconnect is not async, so it runs in a background thread.
-            # wait_for stops waiting after 25 s (the thread itself finishes on its own later).
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_garmin_days_sync, days, today),
-                timeout=GARMIN_TIMEOUT_SECONDS,
+            # shield(): when we stop waiting, the job itself is NOT cancelled
+            await asyncio.wait_for(asyncio.shield(_garmin_task), timeout=GARMIN_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise GarminError(
+                f"Garmin svarte ikke innen {GARMIN_TIMEOUT_SECONDS} sekunder. "
+                "Hentingen fortsetter i bakgrunnen, så last siden på nytt om litt."
             )
-        except Exception as err:
-            _garmin_client = None   # log in again next time
-            message = _garmin_error_message(err)
-            log.warning("[garmin] fetch failed: %s", type(err).__name__)
-            _garmin_cache.update(error=message, error_at=time.monotonic())
-            error_class = GarminLoginError if isinstance(err, GarminLoginError) else GarminError
-            raise error_class(message) from err
+        except Exception:
+            pass   # the error is handled just below
 
-        _garmin_cache.update(fetched_at=time.monotonic(), key=key, days=result, error=None, error_at=0.0)
-        return result
+        _collect_finished_garmin_task()
+        if _garmin_cache["key"] == key and _garmin_cache["error"] is None:
+            return _garmin_cache["days"]
+        _raise_cached_garmin_error()
 
 
 # ─── Weigh-ins (weights.json) ───
 
 MIN_KG, MAX_KG = 30.0, 250.0
 MIN_DATE = date(2000, 1, 1)
+
+# Typed weights: 2–3 digits, optionally a comma or dot and 1–2 decimals ("96", "96,4", "96.45").
+# re.ASCII makes \d mean only 0–9 (not Arabic or other digits); "_" and "1e3" don't match.
+KG_TEXT = re.compile(r"^\d{2,3}([.,]\d{1,2})?$", re.ASCII)
+DATE_TEXT = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
 
 
 def weights_path() -> Path:
@@ -527,10 +599,10 @@ def validate_weight(kg, day=None, today: date | None = None) -> tuple[float, str
 
     # Accept "96,4" as well as 96.4 (Norwegian keyboards use a comma)
     if isinstance(kg, str):
-        try:
-            kg = float(kg.strip().replace(",", "."))
-        except (ValueError, OverflowError):
+        text = kg.strip()
+        if not KG_TEXT.match(text):
             raise ValueError("Vekten må være et tall, for eksempel 96,4.")
+        kg = float(text.replace(",", "."))
     kg = _number(kg, 2)
     if kg is None:
         raise ValueError("Vekten må være et tall, for eksempel 96,4.")
@@ -541,6 +613,8 @@ def validate_weight(kg, day=None, today: date | None = None) -> tuple[float, str
         day = today
     elif isinstance(day, str):
         try:
+            if not DATE_TEXT.match(day.strip()):
+                raise ValueError
             day = date.fromisoformat(day.strip())
         except ValueError:
             raise ValueError("Datoen må ha formatet ÅÅÅÅ-MM-DD.")

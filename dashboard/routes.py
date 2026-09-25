@@ -3,7 +3,7 @@
     GET  /dashboard          → the HTML page
     GET  /dashboard/login    → a small login form (only used when DASHBOARD_TOKEN is set)
     POST /dashboard/login    → checks the token from the form and sets a login cookie
-    GET  /dashboard/api      → the same data as JSON (?refresh=1 fetches fresh data)
+    GET  /dashboard/api      → the same data as JSON (header "X-FitCoach-Refresh: 1" fetches fresh data)
     POST /dashboard/weight   → save a weigh-in, body: {"kg": 96.4, "date": "2026-09-24"}
 
 All routes use include_in_schema=False, so they do NOT show up in /openapi.json
@@ -11,6 +11,7 @@ All routes use include_in_schema=False, so they do NOT show up in /openapi.json
 """
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -50,10 +51,12 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 COOKIE_NAME = "fitcoach_dash"
 COOKIE_MAX_AGE = 90 * 24 * 3600   # 90 days
 LOGIN_FAIL_DELAY = 1.0            # seconds to wait after a wrong token (slows down guessing)
+REFRESH_HEADER = "x-fitcoach-refresh"   # the page sends "X-FitCoach-Refresh: 1" to skip the caches
 
-# Weigh-ins added while in demo mode without WEIGHTS_PATH (kept in memory only)
+# Weigh-ins added in demo mode (kept in memory only, so an open demo never writes to disk)
 _demo_added_weights: list[dict] = []
 _weight_lock = asyncio.Lock()
+_login_lock = asyncio.Lock()      # login attempts are checked one at a time
 
 
 # ─── Settings from the environment ───
@@ -91,13 +94,22 @@ LOCAL_NETWORKS = [
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
 ]
-# Headers a proxy such as ngrok adds. If any is present, the request came from outside.
-PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "forwarded")
+# Headers that proxies and tunnels (ngrok, Cloudflare, nginx …) add.
+# If any of them is present, the request came from outside, even if it
+# reaches us from 127.0.0.1.
+PROXY_HEADERS = (
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded",
+    "x-real-ip", "via", "cf-connecting-ip", "true-client-ip", "x-client-ip",
+)
 
 
 def _cookie_value(token: str) -> str:
-    """What we store in the cookie: a fingerprint (hash) of the token, not the token itself."""
-    return hashlib.sha256(f"fitcoach-dashboard:{token}".encode()).hexdigest()
+    """What we store in the cookie: HMAC(token, "fitcoach-dash-v1").
+
+    A fingerprint of the token, not the token itself. Changing DASHBOARD_TOKEN
+    changes the fingerprint, which logs out every browser.
+    """
+    return hmac.new(token.encode(), b"fitcoach-dash-v1", hashlib.sha256).hexdigest()
 
 
 def _same(a: str, b: str) -> bool:
@@ -152,15 +164,35 @@ def _check_access(request: Request, api: bool) -> Response | None:
     return HTMLResponse(NO_TOKEN_HTML, status_code=401, headers=NO_STORE)
 
 
+def _cross_site_refusal(request: Request) -> Response | None:
+    """Stop other websites from sending forms/requests to our POST routes (CSRF).
+
+    When the dashboard is open because of the visitor's IP address, a bad web page
+    in the same browser could otherwise post to it. Browsers tell us where a
+    request comes from with the Origin and Sec-Fetch-Site headers.
+    """
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        return JSONResponse({"ok": False, "error": "Forespørselen kom fra en annen nettside."}, status_code=403)
+
+    origin = request.headers.get("origin")
+    if origin is not None:
+        allowed = {f"{request.url.scheme}://{request.url.netloc}"}
+        forwarded_host = request.headers.get("x-forwarded-host")
+        if forwarded_host:   # behind ngrok with --host-header=rewrite
+            proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+            allowed.add(f"{proto}://{forwarded_host}")
+        if origin.lower().rstrip("/") not in {a.lower() for a in allowed}:
+            return JSONResponse({"ok": False, "error": "Forespørselen kom fra en annen nettside."}, status_code=403)
+    return None
+
+
 # ─── Collect the data and build the dashboard ───
 
 def _stored_weights_demo(today: date) -> list[dict]:
-    """Demo weigh-ins plus anything added through the form (file or memory)."""
-    added = _demo_added_weights
-    if os.getenv("WEIGHTS_PATH"):
-        added = sources.load_weights(sources.weights_path())
+    """Demo weigh-ins plus anything added through the form (kept in memory only)."""
     entries = demo_weights(today)
-    for e in added:
+    for e in _demo_added_weights:
         entries = sources.upsert_weight(entries, e["kg"], e["date"])
     return entries
 
@@ -279,7 +311,9 @@ async def dashboard_page(request: Request):
         return blocked
 
     try:
-        data = await build_data(force=request.query_params.get("refresh") == "1")
+        # No refresh here on purpose: a GET link or <img> from another site must
+        # not be able to make us hammer HEVY/Garmin. The page's own button uses the API.
+        data = await build_data()
     except Exception:
         log.exception("[dashboard] building the dashboard failed")
         return HTMLResponse(ERROR_HTML, status_code=500, headers=NO_STORE)
@@ -311,6 +345,9 @@ async def login_submit(request: Request):
     token = os.getenv("DASHBOARD_TOKEN", "")
     if not token:
         return RedirectResponse("/dashboard", status_code=303)
+    refused = _cross_site_refusal(request)
+    if refused is not None:
+        return refused
 
     # The form is sent as "token=...". We read it by hand (FastAPI's form
     # support needs an extra package). The token is in the body, never in the URL.
@@ -318,9 +355,12 @@ async def login_submit(request: Request):
     fields = parse_qs(body[:4096].decode("utf-8", errors="replace"))
     given = (fields.get("token") or [""])[0].strip()
 
-    if not given or not _same(given, token):
-        await asyncio.sleep(LOGIN_FAIL_DELAY)   # makes guessing slow
-        return HTMLResponse(_login_html(error="Feil nøkkel. Prøv igjen."), status_code=401, headers=NO_STORE)
+    # One attempt at a time, and a wrong one waits 1 s while holding the lock.
+    # So even many guesses sent at once are answered at most one per second.
+    async with _login_lock:
+        if not given or not _same(given, token):
+            await asyncio.sleep(LOGIN_FAIL_DELAY)
+            return HTMLResponse(_login_html(error="Feil nøkkel. Prøv igjen."), status_code=401, headers=NO_STORE)
 
     response = RedirectResponse("/dashboard", status_code=303)
     is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
@@ -336,13 +376,18 @@ async def login_submit(request: Request):
 
 
 @router.get("/dashboard/api", include_in_schema=False)
-async def dashboard_api(request: Request, refresh: int = 0):
-    """The dashboard data as JSON. ?refresh=1 skips the caches."""
+async def dashboard_api(request: Request):
+    """The dashboard data as JSON.
+
+    To skip the caches, send the header "X-FitCoach-Refresh: 1". It is a header
+    (not ?refresh=1) because other websites cannot add custom headers to a
+    request, but they can make the browser load any URL, e.g. with <img>.
+    """
     blocked = _check_access(request, api=True)
     if blocked is not None:
         return blocked
     try:
-        data = await build_data(force=refresh == 1)
+        data = await build_data(force=request.headers.get(REFRESH_HEADER) == "1")
     except Exception:
         log.exception("[dashboard] building the dashboard failed")
         return JSONResponse({"ok": False, "error": "Noe gikk galt da dashboardet skulle bygges."},
@@ -356,6 +401,15 @@ async def dashboard_weight(request: Request):
     blocked = _check_access(request, api=True)
     if blocked is not None:
         return blocked
+    refused = _cross_site_refusal(request)
+    if refused is not None:
+        return refused
+    # Only real JSON. A plain HTML form on another site can send text/plain or
+    # form data without asking, but not application/json.
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        return JSONResponse({"ok": False, "error": "Send vekten som JSON (Content-Type: application/json)."},
+                            status_code=415)
 
     try:
         body = await request.json()
@@ -367,7 +421,7 @@ async def dashboard_weight(request: Request):
     today = _local_now().date()
     try:
         async with _weight_lock:   # one save at a time, so two quick clicks can't clash
-            if demo_scenario() and not os.getenv("WEIGHTS_PATH"):
+            if demo_scenario():   # demo: memory only, never to disk
                 kg, day = sources.validate_weight(body["kg"], body.get("date"), today)
                 _demo_added_weights[:] = sources.upsert_weight(_demo_added_weights, kg, day)
             else:
@@ -391,15 +445,20 @@ async def dashboard_weight(request: Request):
 # ─── Hide secrets in uvicorn's access log ───
 
 class MaskKeyFilter(logging.Filter):
-    """Replaces "key=<anything>" in access-log lines with "key=***".
+    """Hides secrets in access-log lines: key=, token=, password= (also api_key=,
+    access_token= …) and Authorization values become ***.
 
-    The dashboard no longer puts the token in the URL, but an old bookmark
-    like /dashboard?key=... must still never end up in the log.
+    The dashboard never puts the token in the URL, but an old bookmark like
+    /dashboard?key=... must still never end up in the log.
     """
-    PATTERN = re.compile(r"([?&]key=)[^&\s\"]*", re.IGNORECASE)
+    QUERY_SECRET = re.compile(r"((?:^|[?&;\s])[\w.-]*(?:key|token|password)=)[^&\s\"']*", re.IGNORECASE)
+    AUTHORIZATION = re.compile(r"(authorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+)?[^\s\"',}]+", re.IGNORECASE)
 
     def _mask(self, value):
-        return self.PATTERN.sub(r"\1***", value) if isinstance(value, str) else value
+        if not isinstance(value, str):
+            return value
+        value = self.QUERY_SECRET.sub(r"\1***", value)
+        return self.AUTHORIZATION.sub(r"\1***", value)
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.msg = self._mask(record.msg)
