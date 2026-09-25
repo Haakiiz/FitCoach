@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -76,9 +77,10 @@ def _first(*values):
 # ─── HEVY: workouts ───
 
 WORKOUTS_TTL_SECONDS = 10 * 60   # keep workouts for 10 minutes
+HEVY_ERROR_TTL_SECONDS = 2 * 60  # after a HEVY failure, wait 2 minutes before trying again
 MAX_WORKOUT_PAGES = 40           # safety net: 40 pages × 10 workouts = 400 workouts
 
-_workouts_cache = {"fetched_at": 0.0, "workouts": None}
+_workouts_cache = {"fetched_at": 0.0, "workouts": None, "error": None, "error_at": float("-inf")}
 _workouts_lock = asyncio.Lock()
 
 
@@ -92,42 +94,53 @@ async def fetch_all_workouts(api_key: str, force: bool = False) -> list[dict]:
         raise RuntimeError("HEVY_API_KEY mangler")
 
     async with _workouts_lock:  # two page loads at once should only fetch once
-        age = time.monotonic() - _workouts_cache["fetched_at"]
-        if not force and _workouts_cache["workouts"] is not None and age < WORKOUTS_TTL_SECONDS:
-            return _workouts_cache["workouts"]
-
-        workouts: list[dict] = []
-        page = 1
-        async with httpx.AsyncClient(
-            headers={"api-key": api_key, "accept": "application/json"},
-            timeout=15,
-        ) as client:
-            while page <= MAX_WORKOUT_PAGES:
-                resp = await client.get(
-                    f"{HEVY_API_URL}/workouts",
-                    params={"page": page, "pageSize": 10},
-                )
-                if resp.status_code == 404:
-                    break  # asked past the last page
-                resp.raise_for_status()
-                body = resp.json()
-                chunk = body.get("workouts", [])
-                workouts.extend(chunk)
-
-                page_count = body.get("page_count") or 1
-                if not chunk or page >= page_count:
-                    break
-                page += 1
-
-        if page > MAX_WORKOUT_PAGES:
-            log.warning(
-                "[dashboard] stopped after %d pages of HEVY workouts (MAX_WORKOUT_PAGES); "
-                "older workouts are not shown", MAX_WORKOUT_PAGES,
-            )
-
-        _workouts_cache["workouts"] = workouts
-        _workouts_cache["fetched_at"] = time.monotonic()
+        now = time.monotonic()
+        if not force:
+            if _workouts_cache["workouts"] is not None and now - _workouts_cache["fetched_at"] < WORKOUTS_TTL_SECONDS:
+                return _workouts_cache["workouts"]
+            # HEVY failed a moment ago? Don't ask again on every page load.
+            if _workouts_cache["error"] and now - _workouts_cache["error_at"] < HEVY_ERROR_TTL_SECONDS:
+                raise RuntimeError(_workouts_cache["error"])
+        try:
+            workouts = await _download_workouts(api_key)
+        except Exception as err:
+            _workouts_cache.update(error=f"HEVY-feil: {type(err).__name__}", error_at=time.monotonic())
+            raise
+        _workouts_cache.update(workouts=workouts, fetched_at=time.monotonic(), error=None)
         return workouts
+
+
+async def _download_workouts(api_key: str) -> list[dict]:
+    """Download every page of workouts from HEVY (used by fetch_all_workouts)."""
+    workouts: list[dict] = []
+    page = 1
+    async with httpx.AsyncClient(
+        headers={"api-key": api_key, "accept": "application/json"},
+        timeout=15,
+    ) as client:
+        while page <= MAX_WORKOUT_PAGES:
+            resp = await client.get(
+                f"{HEVY_API_URL}/workouts",
+                params={"page": page, "pageSize": 10},
+            )
+            if resp.status_code == 404:
+                break  # asked past the last page
+            resp.raise_for_status()
+            body = resp.json()
+            chunk = body.get("workouts", [])
+            workouts.extend(chunk)
+
+            page_count = body.get("page_count") or 1
+            if not chunk or page >= page_count:
+                break
+            page += 1
+
+    if page > MAX_WORKOUT_PAGES:
+        log.warning(
+            "[dashboard] stopped after %d pages of HEVY workouts (MAX_WORKOUT_PAGES); "
+            "older workouts are not shown", MAX_WORKOUT_PAGES,
+        )
+    return workouts
 
 
 # ─── HEVY: exercise template → muscle group ───
@@ -138,6 +151,7 @@ MAX_TEMPLATE_PAGES = 50                   # safety net: 50 pages × 100 template
 
 _muscles_memory: dict[str, str] = {}
 _muscles_lock = asyncio.Lock()
+_muscles_error = {"message": None, "at": float("-inf")}
 
 
 async def fetch_template_muscles(api_key: str) -> dict[str, str]:
@@ -163,9 +177,14 @@ async def _fetch_template_muscles(api_key: str) -> dict[str, str]:
             if _muscles_memory:
                 return dict(_muscles_memory)
 
-    # 2) Otherwise download all templates (same paging style as hevy_proxy.py)
+    # 2) Otherwise download all templates (same paging style as hevy_proxy.py),
+    #    unless the download failed less than 2 minutes ago
     if not api_key:
         raise RuntimeError("HEVY_API_KEY mangler")
+    if _muscles_error["message"] and time.monotonic() - _muscles_error["at"] < HEVY_ERROR_TTL_SECONDS:
+        if MUSCLES_CACHE_PATH.exists():   # an old file is better than nothing
+            return json.loads(MUSCLES_CACHE_PATH.read_text(encoding="utf-8"))
+        raise RuntimeError(_muscles_error["message"])
 
     muscles: dict[str, str] = {}
     page = 1
@@ -189,7 +208,8 @@ async def _fetch_template_muscles(api_key: str) -> dict[str, str]:
         if page > MAX_TEMPLATE_PAGES:
             log.warning("[dashboard] stopped after %d pages of exercise templates (MAX_TEMPLATE_PAGES)",
                         MAX_TEMPLATE_PAGES)
-    except Exception:
+    except Exception as err:
+        _muscles_error.update(message=f"HEVY-feil: {type(err).__name__}", at=time.monotonic())
         # Download failed: an old cache file is better than nothing
         if MUSCLES_CACHE_PATH.exists():
             log.warning("[dashboard] template download failed, using the old muscle cache")
@@ -210,6 +230,8 @@ GARMIN_ERROR_TTL_SECONDS = 20 * 60  # after a failure, wait 20 minutes before tr
 GARMIN_TIMEOUT_SECONDS = 45         # the page stops waiting for Garmin after 45 seconds
 GARMIN_WORKERS = 4                  # how many days are fetched at the same time
 PASSWORD_RETRY_SECONDS = 10 * 60    # "Oppdater" may allow a new password login once per 10 min
+GARMIN_TASK_MAX_SECONDS = 10 * 60   # a background job running longer than this is given up
+GARMIN_STALE_MAX_SECONDS = 24 * 3600  # older Garmin data than this is not shown at all
 
 _garmin_cache = {"fetched_at": 0.0, "key": None, "days": None,
                  "error": None, "error_at": 0.0, "error_is_login": False}
@@ -217,13 +239,16 @@ _garmin_lock = asyncio.Lock()
 _garmin_client = None               # the logged-in Garmin client, reused between fetches
 
 # The one background job that talks to Garmin (None when nothing is running).
-# There is never more than one: while it runs, nobody starts another.
+# While it runs, nobody starts another. Only if it hangs for more than 10
+# minutes is it given up (a Python thread can't be stopped from outside, so
+# the hung thread is simply ignored from then on).
 _garmin_task = None
 _garmin_task_key = None
+_garmin_task_started = 0.0
+_garmin_task_box: dict = {}   # the job puts a new login here; only its result is used
 
-# Bumped every time a failed job has been handled. A job only saves its
-# logged-in client if the number has not changed since the job started.
-_garmin_generation = 0
+# Tells a background thread which job (box) it belongs to
+_job_local = threading.local()
 
 # After a failed e-mail/password login we do NOT try the password again by
 # ourselves: repeated attempts can trigger MFA e-mails, "429 Too Many Requests"
@@ -235,7 +260,16 @@ _password_unblocked_at = float("-inf")
 
 
 class GarminError(Exception):
-    """Something went wrong with Garmin. The message is Norwegian and is shown on the page."""
+    """Something went wrong with Garmin. The message is Norwegian and is shown on the page.
+
+    `stale_days` can hold the last good Garmin data (and `stale_minutes` its age),
+    so the page can still show something.
+    """
+
+    def __init__(self, message: str, stale_days: list | None = None, stale_minutes: int | None = None):
+        super().__init__(message)
+        self.stale_days = stale_days
+        self.stale_minutes = stale_minutes
 
 
 class GarminLoginError(GarminError):
@@ -298,6 +332,10 @@ def _garmin_login():
             "Sjekk GARMIN_EMAIL og GARMIN_PASSWORD i .hevy_env."
         ) from err
 
+    # A password login does not know the tokenstore folder by itself, so tokens
+    # that garminconnect refreshes later would not be saved. Tell it where they go
+    # (garminconnect/client.py saves to `_tokenstore_path` after a refresh).
+    client.client._tokenstore_path = tokenstore
     try:
         client.client.dump(tokenstore)   # save tokens so next time step 1 works
     except Exception as err:
@@ -436,13 +474,14 @@ def _fetch_one_day(client, ds: str, bb_entry, runs: list) -> dict:
 
 def _fetch_garmin_days_sync(days: int, today: date) -> list[dict]:
     """The slow, blocking part of fetch_garmin_days (runs in a background thread)."""
-    global _garmin_client
-    generation = _garmin_generation
     client = _garmin_client
     if client is None:
         client = _garmin_login()
-        if generation == _garmin_generation:   # nobody has given up on this job meanwhile
-            _garmin_client = client
+        # Don't change _garmin_client from this thread. Put the new login in this
+        # job's box; fetch_garmin_days keeps it when it collects the job's result.
+        box = getattr(_job_local, "box", None)
+        if box is not None:
+            box["client"] = client
 
     first = today - timedelta(days=days - 1)
     first_s, today_s = first.isoformat(), today.isoformat()
@@ -475,30 +514,61 @@ def _garmin_error_message(err: BaseException) -> str:
     return f"Klarte ikke å hente data fra Garmin ({type(err).__name__}). Vi prøver igjen om litt."
 
 
-def _collect_finished_garmin_task() -> None:
-    """If the background job has finished, move its result (or error) into the cache."""
-    global _garmin_task, _garmin_client, _garmin_generation
+def _run_garmin_job(days: int, today: date, box: dict) -> list[dict]:
+    """What the background thread runs: remember which job we belong to, then fetch."""
+    _job_local.box = box
+    try:
+        return _fetch_garmin_days_sync(days, today)
+    finally:
+        _job_local.box = None
+
+
+def _collect_finished_garmin_task(now: float) -> None:
+    """Move the result (or error) of a finished background job into the cache.
+    A job that has hung for more than 10 minutes is given up."""
+    global _garmin_task, _garmin_client
     task = _garmin_task
-    if task is None or not task.done():
+    if task is None:
+        return
+    if not task.done():
+        if now - _garmin_task_started > GARMIN_TASK_MAX_SECONDS:
+            log.warning("[garmin] background job hung for over 10 minutes, giving up on it")
+            _garmin_task = None
+            _garmin_cache.update(error="Garmin-hentingen hang i over 10 minutter og ble stoppet.",
+                                 error_at=now, error_is_login=False)
         return
     _garmin_task = None
 
     error = asyncio.CancelledError() if task.cancelled() else task.exception()
     if error is None:
+        if _garmin_task_box.get("client") is not None:
+            _garmin_client = _garmin_task_box["client"]   # keep the new login for next time
         _garmin_cache.update(fetched_at=time.monotonic(), key=_garmin_task_key, days=task.result(),
                              error=None, error_at=0.0, error_is_login=False)
         return
 
-    _garmin_generation += 1
     _garmin_client = None   # log in again next time
     log.warning("[garmin] fetch failed: %s", type(error).__name__)
     _garmin_cache.update(error=_garmin_error_message(error), error_at=time.monotonic(),
                          error_is_login=isinstance(error, GarminLoginError))
 
 
-def _raise_cached_garmin_error():
-    error_class = GarminLoginError if _garmin_cache["error_is_login"] else GarminError
-    raise error_class(_garmin_cache["error"])
+def _no_new_garmin_data(message: str, is_login: bool = False) -> list[dict]:
+    """Garmin is busy or failing. Fall back to the last good data:
+    - less than 30 minutes old → just return it (it is still "fresh")
+    - older (max 24 hours) → raise GarminError with the old data attached
+    - nothing at all → raise GarminError without data
+    """
+    days = _garmin_cache["days"]
+    age = time.monotonic() - _garmin_cache["fetched_at"]
+    if days is not None and age < GARMIN_TTL_SECONDS:
+        return days
+    if days is None or age > GARMIN_STALE_MAX_SECONDS:
+        days, minutes = None, None
+    else:
+        minutes = int(age // 60)
+    error_class = GarminLoginError if is_login else GarminError
+    raise error_class(message, stale_days=days, stale_minutes=minutes)
 
 
 async def fetch_garmin_days(days: int = 7, force: bool = False, today: date | None = None) -> list[dict] | None:
@@ -506,15 +576,17 @@ async def fetch_garmin_days(days: int = 7, force: bool = False, today: date | No
 
     - Returns None when Garmin is not configured.
     - Good data is cached for 30 minutes.
-    - A failure raises GarminError (Norwegian message) and is remembered for
-      20 minutes, so a broken Garmin does not slow down every page load.
+    - A failure is remembered for 20 minutes, so a broken Garmin does not slow
+      down every page load. Meanwhile the last good data is used (see
+      _no_new_garmin_data); otherwise a GarminError (Norwegian message) is raised.
     - Only ONE background job talks to Garmin at a time. If it takes longer
-      than 45 s, the page gets a GarminError, the job keeps going, and a later
-      call picks up its result. No new job starts while one is running.
-    - force=True (the "Oppdater" button) skips the caches and may allow a new password
-      login (at most once per 10 minutes).
+      than 45 s, the page stops waiting, the job keeps going, and a later call
+      picks up its result. No new job starts while one is running.
+    - force=True (the "Oppdater" button) skips the caches and may allow a new
+      password login (at most once per 10 minutes).
     """
-    global _garmin_task, _garmin_task_key, _password_login_blocked, _password_unblocked_at
+    global _garmin_task, _garmin_task_key, _garmin_task_started, _garmin_task_box
+    global _password_login_blocked, _password_unblocked_at
     if not garmin_configured():
         return None
 
@@ -522,39 +594,40 @@ async def fetch_garmin_days(days: int = 7, force: bool = False, today: date | No
     key = (days, today.isoformat())
 
     async with _garmin_lock:
-        _collect_finished_garmin_task()
-        if _garmin_task is not None:
-            raise GarminError("Garmin holder fortsatt på med forrige henting. Last siden på nytt om litt.")
-
         now = time.monotonic()
-        fresh = _garmin_cache["key"] == key and now - _garmin_cache["fetched_at"] < GARMIN_TTL_SECONDS
+        _collect_finished_garmin_task(now)
+        if _garmin_task is not None:
+            return _no_new_garmin_data("Garmin holder fortsatt på med forrige henting. Last siden på nytt om litt.")
+
         if not force:
-            if fresh:
+            if _garmin_cache["key"] == key and now - _garmin_cache["fetched_at"] < GARMIN_TTL_SECONDS:
                 return _garmin_cache["days"]
             if _garmin_cache["error"] and now - _garmin_cache["error_at"] < GARMIN_ERROR_TTL_SECONDS:
-                _raise_cached_garmin_error()
+                return _no_new_garmin_data(_garmin_cache["error"], _garmin_cache["error_is_login"])
         elif _password_login_blocked and now - _password_unblocked_at >= PASSWORD_RETRY_SECONDS:
             _password_login_blocked = False
             _password_unblocked_at = now
 
         # Start the background job. garminconnect is not async, so it runs in a thread.
-        _garmin_task = asyncio.ensure_future(asyncio.to_thread(_fetch_garmin_days_sync, days, today))
+        _garmin_task_box = {}
+        _garmin_task = asyncio.ensure_future(asyncio.to_thread(_run_garmin_job, days, today, _garmin_task_box))
         _garmin_task_key = key
+        _garmin_task_started = now
         try:
             # shield(): when we stop waiting, the job itself is NOT cancelled
             await asyncio.wait_for(asyncio.shield(_garmin_task), timeout=GARMIN_TIMEOUT_SECONDS)
         except (asyncio.TimeoutError, TimeoutError):
-            raise GarminError(
+            return _no_new_garmin_data(
                 f"Garmin svarte ikke innen {GARMIN_TIMEOUT_SECONDS} sekunder. "
                 "Hentingen fortsetter i bakgrunnen, så last siden på nytt om litt."
             )
         except Exception:
             pass   # the error is handled just below
 
-        _collect_finished_garmin_task()
+        _collect_finished_garmin_task(time.monotonic())
         if _garmin_cache["key"] == key and _garmin_cache["error"] is None:
             return _garmin_cache["days"]
-        _raise_cached_garmin_error()
+        return _no_new_garmin_data(_garmin_cache["error"], _garmin_cache["error_is_login"])
 
 
 # ─── Weigh-ins (weights.json) ───

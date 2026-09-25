@@ -278,6 +278,16 @@ def _cross_site_refusal(request: Request) -> Response | None:
 
 # ─── Collect the data and build the dashboard ───
 
+def _age_text(minutes: int | None) -> str:
+    """40 → "40 minutter", 125 → "2 timer og 5 minutter"."""
+    minutes = minutes or 0
+    if minutes < 60:
+        return f"{minutes} minutter"
+    hours, rest = divmod(minutes, 60)
+    hours_text = "1 time" if hours == 1 else f"{hours} timer"
+    return f"{hours_text} og {rest} minutter" if rest else hours_text
+
+
 def _stored_weights_demo(today: date) -> list[dict]:
     """Demo weigh-ins plus anything added through the form (kept in memory only)."""
     entries = demo_weights(today)
@@ -331,13 +341,21 @@ async def _gather_inputs(today: date, force: bool) -> dict:
         status["garmin"] = "not_configured"
         garmin_days = None
     elif isinstance(garmin_days, Exception):
-        log.warning("[dashboard] Garmin failed: %s", type(garmin_days).__name__)
-        if isinstance(garmin_days, sources.GarminError):
-            errors.append(str(garmin_days))
+        error = garmin_days
+        log.warning("[dashboard] Garmin failed: %s", type(error).__name__)
+        stale = getattr(error, "stale_days", None)
+        if isinstance(error, sources.GarminError):
+            errors.append(str(error))
         else:
             errors.append("Klarte ikke å hente data fra Garmin. Prøv igjen senere.")
-        status["garmin"] = "error"
-        garmin_days = []
+        if stale:
+            # Show the last good data, and say clearly how old it is
+            errors.append(f"Viser Garmin-data fra {_age_text(error.stale_minutes)} siden.")
+            status["garmin"] = "ok"
+            garmin_days = stale
+        else:
+            status["garmin"] = "error"
+            garmin_days = []
 
     try:
         weights = sources.load_weights(sources.weights_path())

@@ -73,19 +73,22 @@ def fresh_source_state(monkeypatch):
     monkeypatch.setattr(sources, "_workouts_lock", asyncio.Lock())
     monkeypatch.setattr(sources, "_muscles_lock", asyncio.Lock())
     monkeypatch.setattr(sources, "_garmin_lock", asyncio.Lock())
-    monkeypatch.setattr(sources, "_workouts_cache", {"fetched_at": 0.0, "workouts": None})
+    monkeypatch.setattr(sources, "_muscles_error", {"message": None, "at": float("-inf")})
+    monkeypatch.setattr(sources, "_workouts_cache",
+                        {"fetched_at": 0.0, "workouts": None, "error": None, "error_at": float("-inf")})
     monkeypatch.setattr(sources, "_garmin_cache",
                         {"fetched_at": 0.0, "key": None, "days": None,
                          "error": None, "error_at": 0.0, "error_is_login": False})
     monkeypatch.setattr(sources, "_garmin_client", None)
     monkeypatch.setattr(sources, "_garmin_task", None)
     monkeypatch.setattr(sources, "_garmin_task_key", None)
-    monkeypatch.setattr(sources, "_garmin_generation", 0)
+    monkeypatch.setattr(sources, "_garmin_task_started", 0.0)
+    monkeypatch.setattr(sources, "_garmin_task_box", {})
     monkeypatch.setattr(sources, "_password_login_blocked", False)
     monkeypatch.setattr(sources, "_password_unblocked_at", float("-inf"))
     from dashboard import routes
     monkeypatch.setattr(routes, "_weight_lock", asyncio.Lock())
-    monkeypatch.setattr(routes, "_login_lock", asyncio.Lock())
+    monkeypatch.setattr(routes, "_failed_tries", {})
 
 
 @pytest.fixture
@@ -99,6 +102,8 @@ def app(monkeypatch, tmp_path):
     monkeypatch.setenv("WEIGHTS_PATH", str(tmp_path / "weights.json"))
     monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)
     monkeypatch.delenv("DASHBOARD_NAME", raising=False)
+    # TestClient calls itself "testserver"; allow that name like a real home-network name
+    monkeypatch.setenv("DASHBOARD_ALLOWED_HOSTS", "testserver")
     monkeypatch.setattr(routes, "_demo_added_weights", [])
     _install_stub(monkeypatch)
     return hevy_proxy.app
@@ -656,7 +661,8 @@ def test_fetch_all_workouts_reads_every_page(monkeypatch):
     real_client = httpx.AsyncClient
     monkeypatch.setattr(sources.httpx, "AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-    monkeypatch.setattr(sources, "_workouts_cache", {"fetched_at": 0.0, "workouts": None})
+    monkeypatch.setattr(sources, "_workouts_cache",
+                        {"fetched_at": 0.0, "workouts": None, "error": None, "error_at": float("-inf")})
 
     result = asyncio.run(sources.fetch_all_workouts("fake-key"))
     assert [w["id"] for w in result] == ["w1", "w2", "w3"]
