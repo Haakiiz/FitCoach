@@ -24,7 +24,7 @@ USER_TITLES = {
     "Bent Over Row (Barbell)", "Squat (Barbell)", "Bench Press (Dumbbell)",
     "Bench Press (Barbell)", "Push Up", "Inverted Row", "Walking Lunge",
     "Hanging Knee Raise", "Dead Hang", "Single Leg Standing Calf Raise",
-    "Incline Chest Fly (Dumbbell)", "Running",
+    "Incline Chest Fly (Dumbbell)", "Running", "Walking",
 }
 
 
@@ -355,7 +355,8 @@ def test_weight_trend_eta_and_bmi():
     assert w["current_kg"] == 96.0 and w["lost_kg"] == 6.0
     assert w["progress_pct"] == 50.0
     assert w["trend_kg_per_week"] == pytest.approx(-0.5)
-    assert w["eta_date"] == (TODAY + timedelta(weeks=12)).isoformat()
+    eta = TODAY + timedelta(weeks=12)
+    assert w["eta_date"] == (eta - timedelta(days=eta.weekday())).isoformat()   # Monday of that week
     assert w["bmi"] == pytest.approx(28.0, abs=0.05)
 
 
@@ -377,7 +378,8 @@ def test_eta_uses_trend_capped_at_1_5_kg_per_week():
     weights = [{"date": (TODAY - timedelta(days=7 * k)).isoformat(), "kg": 96.0 + 3 * k} for k in range(4)]
     w = build([], weights=weights)["weight"]
     assert w["trend_kg_per_week"] == pytest.approx(-3.0)
-    assert w["eta_date"] == (TODAY + timedelta(weeks=4)).isoformat()      # 6 kg / 1.5 kg per week
+    eta = TODAY + timedelta(weeks=4)                                     # 6 kg / 1.5 kg per week
+    assert w["eta_date"] == (eta - timedelta(days=eta.weekday())).isoformat()
 
 
 def test_stale_weight_is_flagged():
@@ -606,7 +608,7 @@ def test_deload_picks_heaviest_weight_in_window():
     assert deload(22, 99)["next"] == "2×10 @ 16 kg"          # 73 %: close enough to 70 %
     p = deload(16, 99)
     assert p["next"] == "2×12 @ 10 kg"                       # 62 %: two extra reps compensate
-    assert "To ekstra reps" in p["reason"]
+    assert "To ekstra repetisjoner" in p["reason"]
     for kg in (4, 8, 10, 16, 22, 24):
         new = float(deload(kg, 99)["next"].split("@ ")[1].split(" ")[0].replace(",", "."))
         assert 0.55 * kg <= new <= 0.8 * kg
@@ -666,3 +668,161 @@ def test_no_uncertain_quotes():
     texts = " ".join(q["text"] for q in QUOTES)
     assert "komfortabelt og mykt" not in texts
     assert "i din måte å tenke på" not in texts
+
+
+# ─── Round 3: Garmin morning row, cardio without distance, texts and weight jumps ───
+
+import re  # noqa: E402
+
+VISIBLE_ANGLICISMS = ["readiness", "comeback", "Comeback", "deload", "e1RM", " reps", "rep-", "Readiness"]
+
+
+def visible_texts(out):
+    """All sentences a user can read in the output."""
+    rec = out["recommendation"]
+    texts = [out["comeback"]["message"], out["balance"]["message"], rec["title"], *rec["why"],
+             out["recovery"]["status_text"] or ""]
+    texts += [e["note"] + " " + e["label"] for e in rec["exercises"]]
+    texts += [p["reason"] + " " + p["next"] for p in out["progression"]]
+    texts += [n["message"] for n in out["neglected"]]
+    return texts
+
+
+def test_empty_garmin_row_for_today_uses_yesterday():
+    garmin = [garmin_day(TODAY - timedelta(days=i)) for i in range(6, 0, -1)]
+    garmin.append({"date": TODAY.isoformat(), "sleep_seconds": None, "body_battery_peak": None,
+                   "resting_hr": None, "hrv_ms": None, "steps": 1200, "runs": []})
+    rec = build([], garmin=garmin)["recovery"]
+    assert rec["date"] == (TODAY - timedelta(days=1)).isoformat()
+    assert rec["readiness"] is not None and rec["sleep_hours"] == 7.5
+    assert "i går" in rec["status_text"]
+    only_steps = [{"date": TODAY.isoformat(), "steps": 500}]
+    rec = build([], garmin=only_steps)["recovery"]
+    assert rec["connected"] is True and rec["readiness"] is None and "Synk" in rec["status_text"]
+
+
+def timed_run(day, seconds=1800):
+    return workout(day, [exercise("Running", [{"type": "normal", "weight_kg": None, "reps": None,
+                                                "distance_meters": None, "duration_seconds": seconds}])])
+
+
+def test_duration_only_run_counts_and_is_not_doubled_by_garmin():
+    g = garmin_day(TODAY - timedelta(days=1))
+    g["runs"] = [{"km": 5.0, "minutes": 30.0}]
+    out = build([timed_run(TODAY - timedelta(days=1))], garmin=[g])
+    assert out["consistency"]["workouts_last_30d"] == 1
+    assert out["balance"]["cardio"] == 1
+    day = [c for c in out["consistency"]["heatmap"] if c["date"] == (TODAY - timedelta(days=1)).isoformat()][0]
+    assert day["count"] == 1
+    out = build([timed_run(TODAY - timedelta(days=3), 2400), strength_workout(TODAY - timedelta(days=1))])
+    why = " ".join(out["recommendation"]["why"])
+    assert out["recommendation"]["kind"] == "cardio"
+    assert "Ingen kondisøkter" not in why and "Ingen løpeturer" not in why
+    assert "40 min" in why
+
+
+def test_timed_reasons_are_exercise_specific():
+    plank = an.progression_for("Plank", [(TODAY - timedelta(days=2), [tset(60), tset(45)])], 2)
+    assert "grep" not in plank["reason"] and "kjerne" in plank["reason"]
+    assert plank["last"] == "60/45 s" and plank["next"] == "2×55 s"          # avg 52.5 s -> 50 + 5
+    hang = an.progression_for("Dead Hang", [(TODAY - timedelta(days=2), [tset(32)] * 3)], 2)
+    assert hang["next"] == "3×35 s" and "Grep" in hang["reason"]
+    deload = an.progression_for("Plank", [(TODAY - timedelta(days=40), [tset(60)] * 3)], 40)
+    assert deload["next"] == "2×45 s" and "kjernemuskulaturen" in deload["reason"]
+
+
+def test_plural_forms_everywhere():
+    out = build([strength_workout(TODAY - timedelta(days=1))])
+    assert "1 styrkeøkt og 0 kondisøkter" in out["balance"]["message"]
+    assert an._plural(1, "uke", "uker") == "1 uke" and an._days_text(2) == "2 dager"
+    scenarios = [out, build([strength_workout(date(2026, 6, 17))]),
+                 build([timed_run(TODAY - timedelta(days=1))]),
+                 an.build_dashboard([], {}, None, [], TODAY, NOW)]
+    for o in scenarios:
+        for text in visible_texts(o):
+            assert not re.search(r"\b1 (dager|økter|styrkeøkter|kondisøkter|uker|repetisjoner)\b", text), text
+
+
+def test_first_strength_session_for_a_pure_runner():
+    runs = [run_workout(TODAY - timedelta(days=i * 2 + 1)) for i in range(5)]
+    rec = build(runs)["recommendation"]
+    assert rec["kind"] == "strength"
+    assert rec["title"] == "Styrke – første helkroppsøkt"
+    assert "fokus" not in rec["title"]
+    assert any("Ingen styrkeøkter" in w for w in rec["why"])
+
+
+def test_start_reps_after_a_weight_jump():
+    raw, e1rm = an.start_reps_after_jump(22, 12, 24)
+    assert e1rm == pytest.approx(30.8) and int(raw) == 9
+    p = an.progression_for("Dumbbell Row", [(TODAY - timedelta(days=2), [wset(22, 12)] * 4)], 2)
+    assert p["next"] == "4×9 @ 24 kg" and "Epley" in p["reason"]
+    # 16 kg × 15 -> 22 kg: only ~2–3 reps possible, so an in-between step instead of 3×8.
+    p = an.progression_for("Shoulder Press (Dumbbell)", [(TODAY - timedelta(days=2), [wset(16, 15)] * 3)], 2)
+    assert p["kind"] == "weight"
+    assert p["next"] == "1×maks @ 22 kg + 2×15 @ 16 kg"
+    assert "Mellomsteg" in p["reason"]
+    # A small barbell jump starts at most at 10 reps, so there is room to progress.
+    p = an.progression_for("Squat (Barbell)", [(TODAY - timedelta(days=2), [wset(60, 12)] * 3)], 2)
+    assert p["next"] == "3×10 @ 62,5 kg"
+
+
+def test_stale_weight_hides_trend_and_eta():
+    weights = [{"date": (TODAY - timedelta(days=40 - 5 * i)).isoformat(), "kg": 98 - 0.5 * i} for i in range(4)]
+    w = build([], weights=weights)["weight"]
+    assert w["stale_days"] == 25
+    assert w["trend_kg_per_week"] is None and w["eta_date"] is None
+
+
+def test_same_day_weigh_ins_are_averaged():
+    a = build([], weights=[{"date": "2026-09-20", "kg": 97.0}, {"date": "2026-09-20", "kg": 95.5}])
+    b = build([], weights=[{"date": "2026-09-20", "kg": 95.5}, {"date": "2026-09-20", "kg": "97,0"}])
+    assert a["weight"]["current_kg"] == b["weight"]["current_kg"] == 96.2
+
+
+def test_comeback_with_good_recovery_says_we_hold_back():
+    garmin = [garmin_day(TODAY - timedelta(days=i)) for i in range(7, -1, -1)]
+    rec = build([strength_workout(date(2026, 6, 17))], garmin=garmin)["recommendation"]
+    text = " ".join(rec["why"])
+    assert "holder igjen med vilje" in text and "klar for hard økt" not in text
+
+
+def test_training_already_today_says_tomorrow():
+    rec = build([strength_workout(TODAY)])["recommendation"]
+    assert rec["why"][0] == "Sist var styrke (i dag), så vekslingsprinsippet sier kondis i morgen."
+
+
+def test_recovery_day_uses_walking():
+    rec = build([], garmin=[garmin_day(TODAY, sleep_h=4, bb=15)])["recommendation"]
+    assert rec["kind"] == "recovery" and rec["exercises"][0]["name"] == "Walking"
+
+
+def test_weighted_exercise_logged_without_weight():
+    p = an.progression_for("Dumbbell Row", [(TODAY - timedelta(days=2), [wset(0, 12)] * 3)], 2)
+    assert "Kroppsvektøvelse" not in p["reason"] and "uten vekt" in p["reason"]
+
+
+def test_today_and_now_as_text():
+    out = an.build_dashboard([], {}, None, [], "2026-09-24", "2026-09-24T21:15:00+02:00")
+    assert out["today"] == "2026-09-24" and out["greeting"] == "God kveld"
+    assert out["generated_at"] == "2026-09-24T21:15:00+02:00"
+
+
+def test_no_anglicisms_in_visible_text():
+    garmin = [garmin_day(TODAY - timedelta(days=i)) for i in range(7, -1, -1)]
+    scenarios = [
+        build([strength_workout(date(2026, 6, 17))], garmin=garmin),
+        build([run_workout(TODAY - timedelta(days=3)), strength_workout(TODAY - timedelta(days=1))]),
+        build([strength_workout(TODAY - timedelta(days=3)), run_workout(TODAY - timedelta(days=1))]),
+        build([workout(TODAY - timedelta(days=2), [exercise("Plank", [tset(60)] * 2),
+                                                    exercise("Goblet Squat", [wset(10, 12)] * 3)])]),
+    ]
+    for o in scenarios:
+        for text in visible_texts(o):
+            for word in VISIBLE_ANGLICISMS:
+                assert word not in text, (word, text)
+
+
+def test_deload_on_lightest_dumbbell_keeps_weight():
+    p = an.progression_for("Goblet Squat", [(TODAY - timedelta(days=30), [wset(1, 12)] * 3)], 30)
+    assert p["next"] == "2×10 @ 1 kg" and "letteste vekta" in p["reason"] and "100 %" not in p["reason"]

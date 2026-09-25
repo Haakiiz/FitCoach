@@ -1088,6 +1088,11 @@ def _plan_deload(title, last, factor, days_off):
                      sets, str(new_reps))
     old = last["weight"]
     new = ex.deload_weight(title, old, factor) or old
+    if new >= old - 1e-6:        # already on the lightest weight: lighten the volume instead
+        return _plan("deload", _describe(sets, 10, old),
+                     f"{_days_text(days_off)} siden forrige styrkeøkt: {fmt_kg(old)} kg er den letteste vekta "
+                     f"du har, så vi holder vekta og letter i stedet med rolige sett på 10 repetisjoner "
+                     f"{fewer}. {DELOAD_WHY}", sets, "10", old)
     ratio = new / old
     reps = 10 if ratio >= 0.68 else 12             # a lighter-than-planned weight gets 2 extra reps
     extra = " To ekstra repetisjoner veier opp for at nærmeste vekt er litt lett." if reps == 12 else ""

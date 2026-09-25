@@ -818,7 +818,7 @@
       '<ul class="facts">' + lines.map(function (l) { return '<li>' + l + '</li>'; }).join('') + '</ul></div>';
     if (arr(c.heatmap).length) {
       html += '<div class="consist__heat"><div class="chart chart--heat" data-chart="heat"></div>' +
-        '<div class="heatlegend" aria-hidden="true"><span>Mindre</span><i class="h0"></i><i class="h1"></i><i class="h2"></i><i class="h3"></i><span>Mer</span><i class="hf"></i><span>Kommende</span></div></div>';
+        '<div class="heatlegend" aria-hidden="true"><span>Mindre</span><i class="h0"></i><i class="h1"></i><i class="h2"></i><i class="h3"></i><span>Mer</span><i class="hf"></i><span>Kommende</span></div>' + weekMix() + '</div>';
     } else {
       html += '<div class="consist__heat">' + emptyState({ icon: 'calendar', title: 'Ingen treningshistorikk ennå', text: 'Når du logger økter i Hevy, fylles kalenderen her.', compact: true }) + '</div>';
     }
@@ -880,7 +880,6 @@
         (pct > 0 ? '<span class="split__s" style="flex-grow:' + pct + '"></span>' : '') + (pct < 100 ? '<span class="split__c" style="flex-grow:' + (100 - pct) + '"></span>' : '') + '</div>';
       html += '<div class="split__legend"><div><span class="lg"><i class="sw sw--coral"></i>Styrke</span><strong class="split__n">' + num(st) + '</strong><span class="split__p">' + num(pct) + ' %</span></div>' +
         '<div class="split__right"><span class="lg"><i class="sw sw--teal"></i>Kondis</span><strong class="split__n">' + num(ca) + '</strong><span class="split__p">' + num(100 - pct) + ' %</span></div></div>';
-      html += weekMix();
       if (has(b.message)) html += '<p class="balance__msg">' + esc(b.message) + '</p>';
     }
     if (KIND_LABEL[b.next_kind]) {
@@ -895,7 +894,7 @@
     var weeks = heatWeeks().slice(-4);
     if (!weeks.length) return '';
     var t = parseDate(DATA.today);
-    return '<ul class="wkmix" aria-label="Styrke og kondis uke for uke">' + weeks.map(function (wk) {
+    return '<div class="wkmix-wrap"><h3 class="sub-h">Styrke og kondis uke for uke</h3><ul class="wkmix" aria-label="Styrke og kondis uke for uke">' + weeks.map(function (wk) {
       var s = 0, c = 0;
       wk.forEach(function (d) {
         var n = numv(d.count) || 0;
@@ -908,7 +907,7 @@
       for (var i = 0; i < s; i++) dots += '<i class="d-s"></i>';
       for (var j = 0; j < c; j++) dots += '<i class="d-c"></i>';
       return '<li><span class="wkmix__lbl">' + (cur ? 'Denne uka' : 'Uke ' + isoWeek(d0)) + '</span><span class="wkmix__dots" role="img" aria-label="' + esc(plural(s, 'styrkeøkt', 'styrkeøkter') + ', ' + plural(c, 'kondisøkt', 'kondisøkter')) + '">' + (dots || '<span class="wkmix__none">ingen</span>') + '</span></li>';
-    }).join('') + '</ul>';
+    }).join('') + '</ul><p class="wkmix__key"><span><i class="d-s"></i>styrke</span><span><i class="d-c"></i>kondis</span></p></div>';
   }
 
   /* ───────────────────────── Styrke ───────────────────────── */

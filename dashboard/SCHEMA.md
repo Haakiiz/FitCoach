@@ -19,10 +19,10 @@ empty state, never `null`/`NaN`.
     "current_kg": 96.4|null,           // latest weigh-in
     "lost_kg": 5.6|null,
     "progress_pct": 46.7|null,         // 0–100, (start-current)/(start-goal)
-    "trend_kg_per_week": -0.45|null,   // linear fit over last 42 days, needs >=4 points spanning >=14 days
-    "eta_date": "2027-03-01"|null,     // only when trend is negative (trend capped at -1.5 kg/week)
+    "trend_kg_per_week": -0.4|null,    // linear fit over last 42 days, 1 decimal; needs >=4 points spanning >=14 days; null when stale
+    "eta_date": "2027-03-01"|null,     // Monday of the forecast week; only when trend is negative (capped at -1.5 kg/week); null when stale
     "bmi": 28.2|null,
-    "stale_days": 23|null,             // days since the latest weigh-in, only when > 14 (else null)
+    "stale_days": 23|null,             // days since the latest weigh-in, only when >= 14 (else null)
     "entries": [{"date": "2026-09-20", "kg": 96.4}]   // ascending, max 120
   },
 
