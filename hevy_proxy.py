@@ -96,6 +96,8 @@ async def get_workouts(
         since: str | None = None
 ):
     """Retrieve past workouts."""
+    if not HEVY_API_KEY:
+        raise HTTPException(503, "HEVY_API_KEY mangler – GPT-endepunktene er slått av i demo-modus.")
     if pageSize < 1:
         pageSize = 1
     elif pageSize > 10:
@@ -119,6 +121,8 @@ async def get_workouts(
 @app.post("/workouts", status_code=status.HTTP_201_CREATED, operation_id="logWorkout")
 async def log_workout(request: Request):
     """Create a workout in Hevy."""
+    if not HEVY_API_KEY:
+        raise HTTPException(503, "HEVY_API_KEY mangler – GPT-endepunktene er slått av i demo-modus.")
     payload = await request.json()
 
     try:

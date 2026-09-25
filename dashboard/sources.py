@@ -227,7 +227,7 @@ _garmin_generation = 0
 
 # After a failed e-mail/password login we do NOT try the password again by
 # ourselves: repeated attempts can trigger MFA e-mails, "429 Too Many Requests"
-# or even lock the account. "Oppdater" (?refresh=1) can unlock it, but at most
+# or even lock the account. "Oppdater" (force=True) can unlock it, but at most
 # once per 10 minutes. Restarting the proxy also unlocks it. Saved tokens are
 # still tried every time.
 _password_login_blocked = False
@@ -510,7 +510,7 @@ async def fetch_garmin_days(days: int = 7, force: bool = False, today: date | No
     - Only ONE background job talks to Garmin at a time. If it takes longer
       than 45 s, the page gets a GarminError, the job keeps going, and a later
       call picks up its result. No new job starts while one is running.
-    - force=True (?refresh=1) skips the caches and may allow a new password
+    - force=True (the "Oppdater" button) skips the caches and may allow a new password
       login (at most once per 10 minutes).
     """
     global _garmin_task, _garmin_task_key, _password_login_blocked, _password_unblocked_at
