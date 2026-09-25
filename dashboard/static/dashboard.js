@@ -1062,7 +1062,7 @@
     if (!list.length) {
       html += emptyState({ icon: 'check', tone: 'teal', title: 'Alt i balanse', text: 'Alle muskelgrupper er trent den siste uka. Godt jobbet!', compact: true });
     } else {
-      html += '<ul class="neglist grid-fill">' + list.slice(0, 6).map(function (n) {
+      html += '<ul class="neglist grid-fill' + (list.length <= 3 ? ' neglist--one' : '') + '">' + list.slice(0, 6).map(function (n) {
         var d = numv(n.days_since);
         return '<li><div class="neglist__top"><span class="neglist__name">' + esc(cap(n.group)) + '</span>' +
           '<span class="chip ' + (d === null ? 'chip--neutral' : 'chip--coral') + '">' + (d === null ? 'aldri trent' : plural(d, 'dag', 'dager')) + '</span></div>' +

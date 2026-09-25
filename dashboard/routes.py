@@ -452,7 +452,7 @@ class MaskKeyFilter(logging.Filter):
     /dashboard?key=... must still never end up in the log.
     """
     QUERY_SECRET = re.compile(r"((?:^|[?&;\s])[\w.-]*(?:key|token|password)=)[^&\s\"']*", re.IGNORECASE)
-    AUTHORIZATION = re.compile(r"(authorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+)?[^\s\"',}]+", re.IGNORECASE)
+    AUTHORIZATION = re.compile(r"(authorization[\"']?\s*[:=]\s*[\"']?)(?:[A-Za-z]+\s+)?[^\s\"',}]+", re.IGNORECASE)
 
     def _mask(self, value):
         if not isinstance(value, str):

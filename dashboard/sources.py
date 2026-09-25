@@ -279,7 +279,8 @@ def _garmin_login():
     if _password_login_blocked:
         raise GarminLoginError(
             "Innloggingen mot Garmin feilet tidligere, så passordet prøves ikke på nytt av seg selv "
-            "(for å unngå MFA-e-poster og kontolås). Trykk «Oppdater» eller start proxyen på nytt."
+            "(for å unngå MFA-e-poster og kontolås). Trykk «Oppdater» (høyst ett nytt forsøk per 10. minutt) "
+            "eller start proxyen på nytt."
         )
     try:
         client = Garmin(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))

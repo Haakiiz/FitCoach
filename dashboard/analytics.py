@@ -22,6 +22,7 @@ The coaching rules are simple and based on well-established training science:
 All user-facing text is Norwegian (bokmål).
 """
 
+import math
 from datetime import date, datetime, time, timedelta, timezone
 
 from . import exercise_info as ex
@@ -133,9 +134,24 @@ def fmt_pace(minutes, km):
     return f"{total_seconds // 60}:{total_seconds % 60:02d}"
 
 
+def _plural(n, singular, plural):
+    """Number + noun with the right form: _plural(1, 'økt', 'økter') -> '1 økt', 2 -> '2 økter'."""
+    return f"{n} {singular if n == 1 else plural}"
+
+
 def _days_text(n):
     """1 -> '1 dag', 5 -> '5 dager'."""
-    return f"{n} dag" if n == 1 else f"{n} dager"
+    return _plural(n, "dag", "dager")
+
+
+def _reps_text(n):
+    """1 -> '1 repetisjon', 12 -> '12 repetisjoner'."""
+    return _plural(n, "repetisjon", "repetisjoner")
+
+
+def _all_sets(k):
+    """'Settet' for one set, otherwise 'Alle 3 sett'."""
+    return "Settet" if k == 1 else f"Alle {k} sett"
 
 
 def _parse_date(value):
@@ -305,29 +321,28 @@ def _garmin_sorted(garmin_days, today):
     return days
 
 
-def collect_runs(workouts, garmin_days, today):
-    """All runs as [{"date": date, "km", "minutes", "pace", "source"}], newest first.
+def collect_cardio(workouts, garmin_days, today):
+    """Every cardio bout as [{"date", "km", "minutes", "pace", "source"}], newest first.
 
-    HEVY: every cardio exercise with a distance becomes one run (sets are summed).
-    Garmin: runs on a day that already has a HEVY run are skipped, so a treadmill run
-    logged in both places is only counted once.
+    HEVY: every cardio exercise becomes one entry (sets are summed). A treadmill session
+    logged with only a duration still counts – it just has km = None.
+    Garmin: runs on a day that already has ANY HEVY cardio are skipped, so a run logged
+    in both places is only counted once. Use `runs_only()` for entries with a distance.
     """
-    runs = []
+    cardio = []
     hevy_days = set()
     for w in workouts:
         for e in w["exercises"]:
             if not e["cardio"]:
                 continue
-            meters = sum(_num(s.get("distance_meters")) or 0 for s in e["sets"])
-            seconds = sum(_num(s.get("duration_seconds")) or 0 for s in e["sets"])
-            if meters <= 0:
-                continue
-            km = meters / 1000.0
-            minutes = seconds / 60.0 if seconds > 0 else None
-            runs.append({"date": w["date"], "km": round(km, 2),
-                         "minutes": _round(minutes, 1), "pace": fmt_pace(minutes, km),
-                         "source": "hevy"})
             hevy_days.add(w["date"])
+            meters = sum(_set_meters(s) or 0 for s in e["sets"])
+            seconds = sum(_set_seconds(s) or 0 for s in e["sets"])
+            km = meters / 1000.0 if meters > 0 else None
+            minutes = seconds / 60.0 if seconds > 0 else None
+            cardio.append({"date": w["date"], "km": round(km, 2) if km else None,
+                           "minutes": _round(minutes, 1), "pace": fmt_pace(minutes, km),
+                           "source": "hevy"})
     for day, g in _garmin_sorted(garmin_days, today):
         if day in hevy_days:
             continue
@@ -338,19 +353,24 @@ def collect_runs(workouts, garmin_days, today):
             if not km or km <= 0:
                 continue
             minutes = _num(r.get("minutes"))
-            runs.append({"date": day, "km": round(km, 2), "minutes": _round(minutes, 1),
-                         "pace": fmt_pace(minutes, km), "source": "garmin"})
-    runs.sort(key=lambda r: r["date"], reverse=True)
-    return runs
+            cardio.append({"date": day, "km": round(km, 2), "minutes": _round(minutes, 1),
+                           "pace": fmt_pace(minutes, km), "source": "garmin"})
+    cardio.sort(key=lambda r: r["date"], reverse=True)
+    return cardio
 
 
-def build_sessions(workouts, runs):
+def runs_only(cardio):
+    """The cardio entries that have a distance (these are shown as runs)."""
+    return [c for c in cardio if c["km"]]
+
+
+def build_sessions(workouts, cardio):
     """One list of training sessions (oldest first): HEVY workouts plus Garmin-only runs.
 
     Each session: {"date", "kind": "strength"|"cardio"|"mixed", "title"}.
     """
     sessions = [{"date": w["date"], "kind": w["kind"], "title": w["title"]} for w in workouts]
-    for r in runs:
+    for r in cardio:
         if r["source"] == "garmin":
             sessions.append({"date": r["date"], "kind": "cardio", "title": "Løpetur (Garmin)"})
     sessions.sort(key=lambda s: s["date"])
@@ -618,7 +638,9 @@ def build_comeback(days_since_last, last_date):
         f"belastning enn før. Går du rett på gamle vekter, øker risikoen for kraftig stølhet "
         f"(DOMS) og belastningsskader. Den gode nyheten er muskelminnet: cellekjernene du "
         f"har bygget opp i muskelfibrene blir værende, så styrken kommer tilbake mye raskere "
-        f"enn første gang. Regn med 2–3 uker før du er tilbake på gamle tall."
+        f"enn første gang, ofte i løpet av 2–3 uker. Bindevev og sener tilpasser seg derimot "
+        f"tregere enn muskler og trenger flere uker – derfor øker vi gradvis, selv om vektene "
+        f"føles lette."
     )
     return {"active": True, "days_since_last": days_since_last,
             "title": "Velkommen tilbake!", "message": message}
@@ -647,8 +669,8 @@ def build_balance(sessions, today, comeback_active=False):
         next_kind = "cardio" if last_kind == "strength" else "strength"
 
     if total:
-        head = (f"Siste 28 dager: {strength} styrkeøkter og {cardio} kondisøkter "
-                f"({pct} % styrke). ")
+        head = (f"Siste 28 dager: {_plural(strength, 'styrkeøkt', 'styrkeøkter')} og "
+                f"{_plural(cardio, 'kondisøkt', 'kondisøkter')} ({pct} % styrke). ")
     else:
         head = "Ingen økter de siste 28 dagene. "
     if comeback_active or last_kind is None:
@@ -687,11 +709,14 @@ def linear_trend_per_week(points):
 def build_weight(weights, today):
     """Weigh-ins, progress towards 90 kg, trend, ETA and BMI.
 
-    The trend needs at least 4 weigh-ins spread over at least 14 days within the last
-    42 days: day-to-day weight swings 1–2 kg with water and glycogen, so two points a few
-    days apart say nothing about fat loss. The ETA uses the trend capped at ±1.5 kg/week
-    (a realistic upper limit for fat loss). `stale_days` is set when the newest weigh-in
-    is more than 14 days old.
+    - Several weigh-ins on one day are averaged (morning vs. evening can differ 1 kg).
+    - The trend needs at least 4 weigh-ins spread over at least 14 days within the last
+      42 days: day-to-day weight swings 1–2 kg with water and glycogen, so two points a few
+      days apart say nothing about fat loss. It is rounded to 0.1 kg/week.
+    - The ETA uses the trend capped at ±1.5 kg/week (a realistic upper limit for fat loss)
+      and is rounded to the Monday of that week – a forecast is not precise to the day.
+    - `stale_days` is set when the newest weigh-in is 14 days old or more; then trend and
+      ETA are left out, because they would describe the past, not now.
     """
     by_date = {}
     for item in _as_list(weights):
@@ -700,8 +725,8 @@ def build_weight(weights, today):
         day, kg = _parse_date(item.get("date")), _num(item.get("kg"))
         if day is None or kg is None or kg <= 0 or day > today:
             continue
-        by_date[day] = kg                      # the last weigh-in of a day wins
-    entries = sorted(by_date.items())[-120:]
+        by_date.setdefault(day, []).append(kg)
+    entries = sorted((d, sum(kgs) / len(kgs)) for d, kgs in by_date.items())[-120:]
     result = {"start_kg": START_KG, "goal_kg": GOAL_KG, "current_kg": None, "lost_kg": None,
               "progress_pct": None, "trend_kg_per_week": None, "eta_date": None, "bmi": None,
               "stale_days": None, "entries": [{"date": d.isoformat(), "kg": round(kg, 1)} for d, kg in entries]}
@@ -715,19 +740,21 @@ def build_weight(weights, today):
     result["bmi"] = round(current / HEIGHT_M ** 2, 1)
 
     age = (today - entries[-1][0]).days
-    if age > STALE_WEIGHT_DAYS:
+    if age >= STALE_WEIGHT_DAYS:
         result["stale_days"] = age
+        return result
 
     recent = [(d, kg) for d, kg in entries if d >= today - timedelta(days=42)]
     span = (recent[-1][0] - recent[0][0]).days if recent else 0
     trend = linear_trend_per_week(recent) if len(recent) >= 4 and span >= 14 else None
     if trend is not None:
-        result["trend_kg_per_week"] = round(trend, 2)
+        result["trend_kg_per_week"] = round(trend, 1)
         eta_trend = max(-MAX_TREND_KG_PER_WEEK, trend)
         if eta_trend < -0.01 and current > GOAL_KG:
             weeks_left = (current - GOAL_KG) / -eta_trend
             if weeks_left <= 520:              # ignore silly forecasts (> 10 years)
-                result["eta_date"] = (today + timedelta(days=round(weeks_left * 7))).isoformat()
+                eta = today + timedelta(days=round(weeks_left * 7))
+                result["eta_date"] = _monday(eta).isoformat()
     return result
 
 
@@ -787,6 +814,27 @@ def readiness_label(score):
     return "Ta det rolig"
 
 
+RECOVERY_KEYS = ("sleep_seconds", "body_battery_peak", "resting_hr", "hrv_ms")
+
+
+def _has_recovery_signal(day):
+    """True when a Garmin day has at least one of sleep, body battery, resting HR or HRV."""
+    return any(_num(day.get(key)) for key in RECOVERY_KEYS)
+
+
+def _recovery_history(days):
+    """The last 7 Garmin days for the small charts (missing values stay None)."""
+    history = []
+    for d_date, d in days[-7:]:
+        s = _num(d.get("sleep_seconds"))
+        bb, hr = _num(d.get("body_battery_peak")), _num(d.get("resting_hr"))
+        history.append({"date": d_date.isoformat(),
+                        "sleep_hours": round(s / 3600, 1) if s is not None else None,
+                        "body_battery_peak": int(round(bb)) if bb is not None else None,
+                        "resting_hr": int(round(hr)) if hr is not None else None})
+    return history
+
+
 def build_recovery(garmin_days, today):
     empty = {"connected": False, "status_text": "Garmin er ikke tilkoblet", "date": None,
              "readiness": None, "readiness_label": None, "sleep_hours": None, "deep_min": None,
@@ -801,8 +849,18 @@ def build_recovery(garmin_days, today):
                                 "Synk klokka, så dukker søvn og restitusjon opp her.")
         return empty
 
-    day_date, latest = days[-1]
-    previous = [d for _, d in days[:-1]]
+    # sources.py always adds a row for today, which stays empty until the watch syncs.
+    # So we use the newest day that actually has a recovery signal.
+    with_signal = [i for i, (_, d) in enumerate(days) if _has_recovery_signal(d)]
+    history = _recovery_history(days)
+    if not with_signal:
+        empty.update({"connected": True, "history": history,
+                      "status_text": "Ingen søvn- eller pulsdata fra Garmin ennå. Synk klokka etter natta, "
+                                     "så dukker restitusjonen opp her."})
+        return empty
+    index = with_signal[-1]
+    day_date, latest = days[index]
+    previous = [d for _, d in days[:index]]
     score = readiness_score(latest, previous)
 
     def minutes(key):
@@ -814,18 +872,13 @@ def build_recovery(garmin_days, today):
         return int(round(value)) if value is not None else None
 
     sleep_seconds = _num(latest.get("sleep_seconds"))
-    if day_date == today:
+    age = (today - day_date).days
+    if age == 0:
         status = "Oppdatert med data fra i dag"
+    elif age == 1:
+        status = "Siste data fra i går – klokka har ikke synket natta ennå"
     else:
-        status = f"Siste data fra {fmt_date_no(day_date)}"
-    history = []
-    for d_date, d in days[-7:]:
-        s = _num(d.get("sleep_seconds"))
-        bb, hr = _num(d.get("body_battery_peak")), _num(d.get("resting_hr"))
-        history.append({"date": d_date.isoformat(),
-                        "sleep_hours": round(s / 3600, 1) if s is not None else None,
-                        "body_battery_peak": int(round(bb)) if bb is not None else None,
-                        "resting_hr": int(round(hr)) if hr is not None else None})
+        status = f"Siste data fra {fmt_date_no(day_date)} ({_days_text(age)} siden)"
     return {
         "connected": True, "status_text": status, "date": day_date.isoformat(),
         "readiness": score, "readiness_label": readiness_label(score),
@@ -877,6 +930,32 @@ def build_activity(garmin_days, runs, today):
 HEAVY_SET_PCT = 0.8          # sets at >= 80 % of the top weight count as "real" work sets
 HOLD_MIN_DROP_REPS = 2       # reps must fall by at least this much …
 HOLD_MIN_DROP_PCT = 0.10     # … and by about 10 % before we call it a bad day
+START_REPS_MIN = 5           # after a weight increase: never plan fewer than 5 reps …
+START_REPS_MAX = 10          # … or more than 10, so double progression has room to 12
+SPLIT_BELOW_REPS = 6         # below 6 reps on the new weight we use an in-between step
+
+DELOAD_WHY = ("Muskelminnet gjør at styrken kommer raskt tilbake, men bindevev og sener tilpasser "
+              "seg tregere enn muskler – det tar flere uker – så vi øker gradvis.")
+
+# Why longer holds help, per exercise (or per group as a fallback), and what needs time
+# to get used to the load again after a break.
+TIME_REASONS = {
+    "Dead Hang": ("Grepstyrke og senene i underarmene bygges gradvis.", "sener og grep"),
+    "Plank": ("Planken trener kjernemuskulaturen statisk; lengre hold gir mer utholdenhet i de dype "
+              "mage- og ryggmusklene som stabiliserer ryggraden.", "kjernemuskulaturen og korsryggen"),
+}
+TIME_REASONS_BY_GROUP = {
+    "kjerne": ("Lengre statiske hold gir mer utholdenhet i musklene som stabiliserer ryggraden.",
+               "kjernemuskulaturen og korsryggen"),
+    "armer": ("Grepstyrke og senene i underarmene bygges gradvis.", "sener og grep"),
+    "rygg": ("Grepstyrke og skulderstabilitet bygges gradvis.", "sener og grep"),
+}
+TIME_REASON_DEFAULT = ("Litt lengre tid per sett er en liten, målbar økning i belastning.", "muskler og sener")
+
+
+def _round5(seconds):
+    """Round seconds to the nearest 5 (at least 5)."""
+    return max(5, int(round(seconds / 5.0)) * 5)
 
 
 def _describe(n_sets, reps, weight=None, seconds=None):
@@ -896,6 +975,14 @@ def _describe_weighted(pairs):
     if len(weights) == 1:
         return _describe(len(pairs), [r for _, r in pairs], pairs[0][0])
     return ", ".join(f"{fmt_kg(w)} kg × {r}" for w, r in pairs)
+
+
+def _describe_holds(seconds):
+    """'3×30 s' or, with different times, '60/45 s'."""
+    rounded = [int(round(s)) for s in seconds]
+    if len(set(rounded)) == 1:
+        return f"{len(rounded)}×{rounded[0]} s"
+    return "/".join(str(s) for s in rounded) + " s"
 
 
 def _summarize(sets):
@@ -920,16 +1007,15 @@ def _summarize(sets):
                 "seconds": None, "text": _describe(len(reps), reps)}
     seconds = [_set_seconds(s) for s in sets if _set_seconds(s)]
     if seconds:
-        average = sum(seconds) / len(seconds)
         return {"type": "time", "weight": None, "reps": [], "sets": len(seconds),
-                "seconds": average, "text": _describe(len(seconds), None, seconds=average)}
+                "seconds": sum(seconds) / len(seconds), "text": _describe_holds(seconds)}
     return None
 
 
-def _plan(kind, next_text, reason, sets, reps, weight=None):
+def _plan(kind, next_text, reason, sets, reps, weight=None, note=None):
     """The result of one progression rule (schema fields + plan fields for the workout)."""
     return {"kind": kind, "next": next_text, "reason": reason,
-            "plan_sets": sets, "plan_reps": reps, "plan_weight": weight}
+            "plan_sets": sets, "plan_reps": reps, "plan_weight": weight, "plan_note": note}
 
 
 def _rack_weight(title, kg):
@@ -964,24 +1050,32 @@ def _fewer_sets_text(new_sets, old_sets):
     return "og ett sett færre" if new_sets < old_sets else "og samme antall sett"
 
 
-def _plan_time(last, factor, days_off):
-    """Timed holds (Dead Hang): +5 seconds, or ~70 % of the time after a break."""
+def _time_reasons(title):
+    """(why longer holds help, what needs time after a break) for a timed exercise."""
+    if title in TIME_REASONS:
+        return TIME_REASONS[title]
+    return TIME_REASONS_BY_GROUP.get(ex.group(title), TIME_REASON_DEFAULT)
+
+
+def _plan_time(title, last, factor, days_off):
+    """Timed holds (Dead Hang, Plank): +5 seconds, or ~70 % of the time after a break."""
     n, sec = last["sets"], last["seconds"]
+    why, tissue = _time_reasons(title)
     if factor:
-        new_sec = max(10, int(round(sec * factor / 5)) * 5)
+        new_sec = max(10, _round5(sec * factor))
         sets = max(2, n - 1)
         return _plan("deload", _describe(sets, None, seconds=new_sec),
                      f"{_days_text(days_off)} siden forrige styrkeøkt: vi starter på ca. {int(factor * 100)} % "
-                     f"av tiden ({int(round(sec))} → {new_sec} s), så sener og grep får venne seg til "
-                     f"belastningen igjen.", sets, f"{new_sec} s")
-    new_sec = int(round(sec)) + 5
+                     f"av tiden ({_round5(sec)} → {new_sec} s), så {tissue} får venne seg til belastningen igjen.",
+                     sets, f"{new_sec} s")
+    new_sec = _round5(sec) + 5
     return _plan("reps", _describe(n, None, seconds=new_sec),
-                 f"Du holdt {int(round(sec))} s sist. Fem sekunder mer per sett er en liten, målbar "
-                 f"økning – grepstyrke og senetoleranse bygges gradvis.", n, f"{new_sec} s")
+                 f"Du holdt i snitt {int(round(sec))} s sist. Fem sekunder mer per sett er en liten, målbar "
+                 f"økning. {why}", n, f"{new_sec} s")
 
 
 def _plan_deload(title, last, factor, days_off):
-    """Comeback: lighter load (60–80 % depending on the rack), fewer sets, a few more reps."""
+    """Long break: lighter load (60–80 % depending on the rack), fewer sets, a few more reps."""
     n = last["sets"]
     sets = max(2, n - 1)
     fewer = _fewer_sets_text(sets, n)
@@ -990,17 +1084,16 @@ def _plan_deload(title, last, factor, days_off):
         new_reps = max(5, int(round(avg_reps * factor)))
         return _plan("deload", _describe(sets, new_reps),
                      f"{_days_text(days_off)} siden forrige styrkeøkt: ca. {int(round(factor * 100))} % av "
-                     f"repsene ({int(round(avg_reps))} → {new_reps}) {fewer}. Bindevevet tåler mindre "
-                     f"etter en pause, og det reduserer stølheten de neste dagene.", sets, str(new_reps))
+                     f"repetisjonene ({int(round(avg_reps))} → {new_reps}) {fewer}. {DELOAD_WHY}",
+                     sets, str(new_reps))
     old = last["weight"]
     new = ex.deload_weight(title, old, factor) or old
     ratio = new / old
     reps = 10 if ratio >= 0.68 else 12             # a lighter-than-planned weight gets 2 extra reps
-    extra = " To ekstra reps veier opp for at nærmeste vekt er litt lett." if reps == 12 else ""
+    extra = " To ekstra repetisjoner veier opp for at nærmeste vekt er litt lett." if reps == 12 else ""
     return _plan("deload", _describe(sets, reps, new),
                  f"{_days_text(days_off)} siden forrige styrkeøkt: start på {fmt_kg(new)} kg i stedet for "
-                 f"{fmt_kg(old)} kg (ca. {int(round(ratio * 100))} %) {fewer}.{extra} Nervesystem og sener "
-                 f"trenger 1–2 uker på å tåle full last igjen, mens muskelminnet gjør at du er tilbake raskt.",
+                 f"{fmt_kg(old)} kg (ca. {int(round(ratio * 100))} %) {fewer}.{extra} {DELOAD_WHY}",
                  sets, str(reps), new)
 
 
@@ -1013,21 +1106,25 @@ def _plan_hold(title, prev, last):
         weight, note = _rack_weight(title, last["weight"])
     load = f" på {fmt_kg(last['weight'])} kg" if last["weight"] else ""
     return _plan("hold", _describe(n, target, weight),
-                 f"Repsene falt fra {'/'.join(map(str, prev['reps']))} til {'/'.join(map(str, last['reps']))}"
-                 f"{load}. Det tyder oftere på dårlig søvn eller restitusjon enn tapt styrke, så vi holder "
-                 f"belastningen og sikter på {target} reps per sett igjen før vi øker. {note}".strip(),
-                 n, str(target), weight)
+                 f"Repetisjonene falt fra {'/'.join(map(str, prev['reps']))} til "
+                 f"{'/'.join(map(str, last['reps']))}{load}. Det tyder oftere på dårlig søvn eller restitusjon "
+                 f"enn tapt styrke, så vi holder belastningen og sikter på {_reps_text(target)} per sett igjen "
+                 f"før vi øker. {note}".strip(), n, str(target), weight)
 
 
-def _plan_bodyweight(last):
-    """Bodyweight: +2 reps per set."""
+def _plan_bodyweight(title, last):
+    """No external load: +2 reps per set."""
     n = last["sets"]
     avg_reps = sum(last["reps"]) / len(last["reps"])
     new_reps = int(round(avg_reps)) + 2
-    return _plan("reps", _describe(n, new_reps),
-                 f"Kroppsvektøvelse: du tok i snitt {fmt_num(avg_reps)} reps sist. To reps mer per sett "
-                 f"øker volumet ca. {int(round(2 / avg_reps * 100))} % – progressiv overbelastning uten "
-                 f"ekstra vekt.", n, str(new_reps))
+    extra_pct = int(round(2 / avg_reps * 100))
+    if ex.equipment_kind(title) in ("dumbbell", "barbell", "machine"):
+        reason = (f"Sist ble øvelsen logget uten vekt, med i snitt {fmt_num(avg_reps)} repetisjoner. Vi legger på "
+                  f"to repetisjoner per sett – og logger du vekta neste gang, kan vi bruke dobbel progresjon.")
+    else:
+        reason = (f"Kroppsvektøvelse: du tok i snitt {fmt_num(avg_reps)} repetisjoner sist. To mer per sett øker "
+                  f"volumet ca. {extra_pct} % – progressiv overbelastning uten ekstra vekt.")
+    return _plan("reps", _describe(n, new_reps), reason, n, str(new_reps))
 
 
 def _plan_at_max(title, weight, n, note):
@@ -1041,14 +1138,49 @@ def _plan_at_max(title, weight, n, note):
         why_max = f"{fmt_kg(weight)} kg er det tyngste du har tilgjengelig"
     if n < MAX_SETS:
         return _plan("sets", _describe(n + 1, TOP_REPS, weight),
-                     f"{note}Alle sett nådde {TOP_REPS} reps, men {why_max}. Vi øker volumet i stedet: "
+                     f"{note}Alle sett nådde {TOP_REPS} repetisjoner, men {why_max}. Vi øker volumet i stedet: "
                      f"{n} → {n + 1} sett. Når lasten ikke kan økes, er flere harde sett den neste "
                      f"driveren for muskelvekst.", n + 1, str(TOP_REPS), weight)
     new_reps = TOP_REPS + 3
     return _plan("reps", _describe(n, new_reps, weight),
-                 f"{note}{why_max[0].upper() + why_max[1:]}, og du er allerede på {MAX_SETS} sett. Neste steg "
-                 f"er flere reps ({new_reps}) og langsommere senking (3 sekunder) for mer tid under spenning.",
+                 f"{note}{why_max[0].upper() + why_max[1:]}, og du er allerede på {MAX_SETS} sett. Neste steg er "
+                 f"flere repetisjoner ({new_reps}) og langsommere senking (3 sekunder) for mer tid under spenning.",
                  n, str(new_reps), weight)
+
+
+def start_reps_after_jump(old_kg, reps_done, new_kg):
+    """How many reps are realistic on a heavier weight, from the estimated max (Epley).
+
+    raw = 30 × (e1RM × 1.03 / new − 1): Epley solved for reps, with 3 % extra for the
+    progress you make by the next session. Returns (raw_reps, e1RM).
+    """
+    e1rm = epley(old_kg, min(reps_done, 15)) or old_kg
+    return 30 * (e1rm * 1.03 / new_kg - 1), e1rm
+
+
+def _plan_weight_up(title, n, reps, logged, up):
+    """All sets reached the top: go to the next weight, starting at a realistic rep count."""
+    jump_pct = int(round((up - logged) / logged * 100))
+    raw, e1rm = start_reps_after_jump(logged, min(reps), up)
+    lead = (f"{_all_sets(len(reps))} nådde {_reps_text(min(reps))} – dobbel progresjon sier mer vekt: "
+            f"{fmt_kg(logged)} → {fmt_kg(up)} kg (+{jump_pct} %). ")
+    if math.floor(raw) >= SPLIT_BELOW_REPS:
+        start = max(START_REPS_MIN, min(START_REPS_MAX, int(math.floor(raw))))
+        return _plan("weight", _describe(n, start, up),
+                     lead + f"Estimert maks er {fmt_num(e1rm)} kg (Epleys formel), så {fmt_kg(up)} kg passer for ca. "
+                     f"{_reps_text(start)}. Start der og bygg opp mot {TOP_REPS} igjen.",
+                     n, f"{start}–{TOP_REPS}", up)
+    heavy = 2 if n >= 4 else 1
+    light = n - heavy
+    possible = max(1, int(math.floor(30 * (e1rm / up - 1))))
+    step = f"{_plural(heavy, 'sett', 'sett')} på {fmt_kg(up)} kg og {_plural(light, 'sett', 'sett')} på {fmt_kg(logged)} kg"
+    return _plan("weight", f"{heavy}×maks @ {fmt_kg(up)} kg + {light}×{min(reps)} @ {fmt_kg(logged)} kg",
+                 lead + f"Men estimert maks er {fmt_num(e1rm)} kg (Epleys formel), så du klarer bare rundt "
+                 f"{_reps_text(possible)} på {fmt_kg(up)} kg – for lite til å bygge på. Mellomsteg: {step}. Ta de "
+                 f"tunge settene til du har 1–2 repetisjoner igjen. Når du klarer {SPLIT_BELOW_REPS} på "
+                 f"{fmt_kg(up)} kg, flytter alle settene opp.",
+                 n, "maks", up,
+                 note=f"Mellomsteg: {step}. Ta de tunge settene nesten til grensen.")
 
 
 def _plan_double_progression(title, last):
@@ -1065,22 +1197,19 @@ def _plan_double_progression(title, last):
         jump_pct = (up - logged) / logged * 100
         if ex.load_kind(title) == "dumbbell" and jump_pct > BIG_JUMP_PCT and min(reps) < 15:
             return _plan("reps", _describe(n, 15, weight),
-                         f"{note}Alle sett nådde {TOP_REPS} reps, men neste manual er {fmt_kg(up)} kg "
-                         f"(+{int(round(jump_pct))} %) – for stort hopp på én gang. Vi strekker rep-rommet "
+                         f"{note}Alle sett nådde {TOP_REPS} repetisjoner, men neste manual er {fmt_kg(up)} kg "
+                         f"(+{int(round(jump_pct))} %) – for stort hopp på én gang. Vi utvider repetisjonsområdet "
                          f"til 15 først, så blir overgangen til {fmt_kg(up)} kg håndterbar.", n, "15", weight)
-        return _plan("weight", _describe(n, BOTTOM_REPS, up),
-                     f"Alle {len(reps)} sett nådde {min(reps)} reps – dobbel progresjon sier mer vekt: "
-                     f"{fmt_kg(logged)} → {fmt_kg(up)} kg (+{int(round(jump_pct))} %). Start på "
-                     f"{BOTTOM_REPS} reps og bygg opp mot {TOP_REPS} igjen.", n, f"{BOTTOM_REPS}–{TOP_REPS}", up)
+        return _plan_weight_up(title, n, reps, logged, up)
 
     target = min(TOP_REPS, min(reps) + 2)
     done = f"Du tok {_describe(len(reps), reps)} på {fmt_kg(logged)} kg. "
     if at_cap:
         cap_text = note or f"{fmt_kg(cap)} kg er taket du har satt. "
-        reason = (f"{done}{cap_text}Her bygger vi videre med reps og deretter sett: "
+        reason = (f"{done}{cap_text}Her bygger vi videre med repetisjoner og deretter sett: "
                   f"sikt på {target} per sett.")
     else:
-        reason = (f"{done}{note}Bli på vekta og legg på reps til alle sett når {TOP_REPS} – først da "
+        reason = (f"{done}{note}Bli på vekta og legg på repetisjoner til alle sett når {TOP_REPS} – først da "
                   f"øker vi. Slik vokser volumet før belastningen, og sener og ledd rekker å henge med.")
     return _plan("reps", _describe(n, target, weight), reason, n, str(target), weight)
 
@@ -1089,10 +1218,10 @@ def progression_for(title, sessions, strength_days_off=None):
     """Next-session suggestion for one exercise, using double progression.
 
     `sessions` is [(date, [work sets]), …] oldest first. The rules, in order:
-    timed hold -> +5 s; long break -> deload; clear drop in reps -> hold;
-    bodyweight -> +2 reps; weighted -> double progression (reps first, then weight).
+    timed hold -> +5 s; long break -> lighter restart; clear drop in reps -> hold;
+    no load -> +2 reps; weighted -> double progression (reps first, then weight).
     Returns the schema fields (exercise, label, last, next, kind, reason) plus plan
-    fields for the recommended workout (plan_sets, plan_reps, plan_weight), or None.
+    fields for the recommended workout (plan_sets, plan_reps, plan_weight, plan_note), or None.
     """
     usable = [(d, _summarize(sets)) for d, sets in sessions]
     usable = [(d, s) for d, s in usable if s]
@@ -1103,13 +1232,13 @@ def progression_for(title, sessions, strength_days_off=None):
     factor = comeback_factor(strength_days_off)
 
     if last["type"] == "time":
-        plan = _plan_time(last, factor, strength_days_off)
+        plan = _plan_time(title, last, factor, strength_days_off)
     elif factor:
         plan = _plan_deload(title, last, factor, strength_days_off)
     elif _reps_fell(prev, last):
         plan = _plan_hold(title, prev, last)
     elif last["type"] == "bodyweight":
-        plan = _plan_bodyweight(last)
+        plan = _plan_bodyweight(title, last)
     else:
         plan = _plan_double_progression(title, last)
 
@@ -1136,6 +1265,7 @@ def _public_progression(p):
 # ═══════════════════════════ Recommendation ═══════════════════════════
 
 FINISHERS = ("Hanging Knee Raise", "Single Leg Standing Calf Raise", "Dead Hang")
+WALK_TITLE = "Walking" if "Walking" in ex.EXERCISES else "Running"
 
 
 def _pick_for_pattern(candidates, last_dates):
@@ -1156,10 +1286,12 @@ def _exercise_entry(title, progressions, default_sets=3, default_reps="10–12",
         entry["sets"] = p["plan_sets"]
         entry["reps"] = p["plan_reps"] or default_reps
         entry["weight_kg"] = p["plan_weight"]
-        if note is None and p["kind"] == "weight":
+        if note is None and p.get("plan_note"):
+            entry["note"] = p["plan_note"] + " " + ex.cue(title)
+        elif note is None and p["kind"] == "weight":
             entry["note"] = f"Ny vekt: {fmt_kg(p['plan_weight'])} kg! " + ex.cue(title)
     elif ex.equipment_kind(title) in ("dumbbell", "barbell"):
-        entry["note"] = ("Ny øvelse: velg en vekt der du har 2–3 reps i reserve. " + ex.cue(title)).strip()
+        entry["note"] = ("Ny øvelse: velg en vekt der du har 2–3 repetisjoner i reserve. " + ex.cue(title)).strip()
     return entry
 
 
@@ -1205,22 +1337,30 @@ def _strength_exercises(progressions, last_dates, neglected, comeback):
     return entries, boost_group, boost
 
 
-def _common_reasons(ctx):
-    """Reusable Norwegian sentences: the fat-loss goal and the recovery score."""
+def _fat_loss_reason(ctx):
     current = ctx["weight"]["current_kg"]
     if current is not None and current > GOAL_KG:
-        fat_loss = f"Målet er 90 kg: du er på {fmt_num(current)} kg nå, {fmt_num(current - GOAL_KG)} kg igjen."
-    elif current is not None:
-        fat_loss = f"Du er på {fmt_num(current)} kg – under målet på 90 kg. Nå handler det om å holde det."
-    else:
-        fat_loss = "Målet er å gå ned fra 102 til 90 kg."
-    readiness_text = None
-    if ctx["readiness"] is not None:
-        sleep = ctx["sleep_hours"]
-        sleep_part = f" etter {fmt_num(sleep)} t søvn" if sleep is not None else ""
-        readiness_text = (f"Restitusjonsscoren er {ctx['readiness']}/100 "
-                          f"({readiness_label(ctx['readiness']).lower()}){sleep_part}.")
-    return fat_loss, readiness_text
+        return f"Målet er 90 kg: du er på {fmt_num(current)} kg nå, {fmt_num(current - GOAL_KG)} kg igjen."
+    if current is not None:
+        return f"Du er på {fmt_num(current)} kg – under målet på 90 kg. Nå handler det om å holde det."
+    return "Målet er å gå ned fra 102 til 90 kg."
+
+
+def _recovery_reason(ctx, holding_back=False):
+    """'Restitusjonsscoren er 72/100 …' (None without fresh Garmin data).
+
+    With `holding_back` (a gentle comeback day) a high score is acknowledged, but we
+    explain that the light load is on purpose.
+    """
+    score = ctx["readiness"]
+    if score is None:
+        return None
+    sleep = ctx["sleep_hours"]
+    sleep_part = f" etter {fmt_num(sleep)} t søvn" if sleep is not None else ""
+    if holding_back and score >= 45:
+        return (f"Restitusjonsscoren er {score}/100{sleep_part}, så kroppen er klar – men vi holder igjen "
+                f"med vilje de første øktene.")
+    return f"Restitusjonsscoren er {score}/100 ({readiness_label(score).lower()}){sleep_part}."
 
 
 def _alternation_reason(ctx):
@@ -1231,7 +1371,8 @@ def _alternation_reason(ctx):
     when = {0: "i dag", 1: "i går"}.get(days_since, f"for {_days_text(days_since)} siden")
     prev = "styrke" if last_kind == "strength" else "kondis"
     now_kind = "kondis" if ctx["next_kind"] == "cardio" else "styrke"
-    return f"Sist var {prev} ({when}), så vekslingsprinsippet sier {now_kind} nå."
+    moment = "i morgen" if days_since == 0 else "nå"
+    return f"Sist var {prev} ({when}), så vekslingsprinsippet sier {now_kind} {moment}."
 
 
 def _finish(kind, title, duration, intensity, why, exercises):
@@ -1240,22 +1381,22 @@ def _finish(kind, title, duration, intensity, why, exercises):
             "why": [w.strip() for w in why if w][:4], "exercises": exercises}
 
 
-def _recovery_plan(ctx, fat_loss, readiness_text):
+def _recovery_plan(ctx):
     exercises = [
-        {"name": "Running", "label": "Rolig gange på løpebånd", "sets": 1, "reps": "30 min", "weight_kg": None,
+        {"name": WALK_TITLE, "label": "Rolig gange (løpebånd)", "sets": 1, "reps": "30 min", "weight_kg": None,
          "note": "Sone 1–2: rask gange med 3–5 % stigning. Du skal kunne prate uanstrengt."},
         _exercise_entry("Dead Hang", {}, default_sets=3, default_reps="20–30 s"),
         _exercise_entry("Walking Lunge", {}, default_sets=2, default_reps="10 per bein",
                         note="Uten vekt, rolig og kontrollert – mest for hoftemobilitet."),
     ]
-    why = [readiness_text,
+    why = [_recovery_reason(ctx),
            "Hard trening på dårlig restitusjon gir mer stresshormoner og høyere skaderisiko, men ikke mer "
            "fremgang. Rolig bevegelse øker blodgjennomstrømningen og gjør deg klarere til neste økt.",
-           f"Rask gange forbrenner fortsatt ca. 200 kcal på 30 minutter. {fat_loss}"]
+           f"Rask gange forbrenner fortsatt ca. 200 kcal på 30 minutter. {_fat_loss_reason(ctx)}"]
     return _finish("recovery", "Restitusjon – rolig gange og mobilitet", 40, "Lett", why, exercises)
 
 
-def _comeback_plan(ctx, fat_loss, readiness_text):
+def _comeback_plan(ctx):
     exercises, boost_group, boost = _strength_exercises(
         ctx["progressions"], ctx["last_dates"], ctx["neglected"], comeback=True)
     why = [f"Det er {_days_text(ctx['days_since_last'])} siden forrige økt, så vi starter på ca. 60–80 % "
@@ -1266,25 +1407,25 @@ def _comeback_plan(ctx, fat_loss, readiness_text):
                    f"tar plassen som siste øvelse – bare to lette sett.")
     why.append("Helkropp med knebøy, hoftehengsel, press og trekk vekker alle de store bevegelsesmønstrene "
                "igjen, uten at én muskelgruppe tar hele støyten (og all stølheten).")
-    why.append(readiness_text)
-    why.append(fat_loss)
+    why.append(_recovery_reason(ctx, holding_back=True))
+    why.append(_fat_loss_reason(ctx))
     return _finish("strength", "Velkommen tilbake – helkropp på lett last",
                    min(45, _estimate_minutes(exercises)), "Lett til moderat", why, exercises)
 
 
-def _strength_plan(ctx, fat_loss, readiness_text):
-    first_session = ctx["days_since_last"] is None
-    neglected = [] if first_session else ctx["neglected"]     # "never trained" means nothing yet
+def _strength_plan(ctx):
+    first_strength = ctx["strength_days_off"] is None
+    neglected = [] if first_strength else ctx["neglected"]   # no strength yet: nothing is "neglected"
     exercises, _, _ = _strength_exercises(ctx["progressions"], ctx["last_dates"], neglected, comeback=False)
-    if first_session:
+    if first_strength:
         title = "Styrke – første helkroppsøkt"
     else:
         title = "Styrke – helkropp" + (f" med fokus på {neglected[0]['group']}" if neglected else "")
     why = [_alternation_reason(ctx)]
-    if first_session:
-        why.append("Ingen økter registrert ennå, så vi starter med én øvelse for hvert stort "
+    if first_strength:
+        why.append("Ingen styrkeøkter registrert ennå, så vi starter balansert med én øvelse for hvert stort "
                    "bevegelsesmønster: knebøy, hoftehengsel, press og trekk.")
-    if neglected:
+    elif neglected:
         why.append(f"{neglect_sentence(neglected[0]['group'], neglected[0]['days_since'])[:-1]}, "
                    f"så vi starter økta der, mens du er uthvilt.")
     planned = [e["name"] for e in exercises]
@@ -1296,28 +1437,32 @@ def _strength_plan(ctx, fat_loss, readiness_text):
         p = weight_ups[0]
         why.append(f"Dobbel progresjon: {p['label'].lower()} går opp til {fmt_kg(p['plan_weight'])} kg i dag.")
     why.append("Helkroppsstyrke i kaloriunderskudd sørger for at vekttapet kommer fra fett og ikke muskler. "
-               + fat_loss)
-    why.append(readiness_text)
+               + _fat_loss_reason(ctx))
+    why.append(_recovery_reason(ctx))
     readiness = ctx["readiness"]
     intensity = "Hard" if readiness is not None and readiness >= 70 else "Moderat"
     return _finish("strength", title, _estimate_minutes(exercises), intensity, why, exercises)
 
 
-def _run_text(run):
-    """'4 km på 28 min (7:00 min/km)'."""
-    text = f"{fmt_num(run['km'])} km"
-    if run["minutes"]:
-        text += f" på {fmt_num(run['minutes'], 0)} min"
-    if run["pace"]:
-        text += f" ({run['pace']} min/km)"
+def _cardio_text(entry):
+    """'4 km på 28 min (7:00 min/km)' or just '30 min' when no distance was logged."""
+    parts = []
+    if entry["km"]:
+        parts.append(f"{fmt_num(entry['km'])} km")
+    if entry["minutes"]:
+        parts.append(f"{fmt_num(entry['minutes'], 0)} min")
+    text = " på ".join(parts) or "uten registrert tid"
+    if entry["pace"]:
+        text += f" ({entry['pace']} min/km)"
     return text
 
 
-def _cardio_plan(ctx, fat_loss, readiness_text):
-    """Alternate between intervals (after a long easy run) and zone 2 (after a short hard one)."""
-    runs, readiness = ctx["runs"], ctx["readiness"]
-    last_run = runs[0] if runs else None
-    last_long = bool(last_run and (last_run["minutes"] or 0) >= 25)
+def _cardio_plan(ctx):
+    """Alternate between intervals (after a long easy session) and zone 2 (after a short hard one)."""
+    cardio, readiness = ctx["cardio"], ctx["readiness"]
+    last = cardio[0] if cardio else None
+    last_minutes = (last or {}).get("minutes") or 0
+    last_long = last_minutes >= 25
     core = _exercise_entry("Hanging Knee Raise", ctx["progressions"])
     if last_long and (readiness is None or readiness >= 60):
         running = {"name": "Running", "label": "Intervaller på løpebånd", "sets": 6, "reps": "2 min",
@@ -1325,26 +1470,28 @@ def _cardio_plan(ctx, fat_loss, readiness_text):
                    "note": "10 min rolig oppvarming, så 6 × 2 min hardt (sone 4, ca. 85–90 % av makspuls) "
                            "med 90 sek gange mellom. Avslutt med 5 min rolig."}
         why = [_alternation_reason(ctx),
-               f"Siste løpetur var rolige {_run_text(last_run)}, så nå veksler vi til intervaller.",
+               f"Siste kondisøkt var {_cardio_text(last)} i jevnt tempo, så nå veksler vi til intervaller.",
                "Intervaller øker det maksimale oksygenopptaket (VO₂maks) mer effektivt enn rolig løping, "
                "og gir en etterforbrenning (EPOC) som varer i timer.",
-               readiness_text, fat_loss]
+               _recovery_reason(ctx), _fat_loss_reason(ctx)]
         return _finish("cardio", "Kondis – intervaller 6 × 2 min", 45, "Hard", why, [running, core])
 
-    minutes = 30 if not last_run else (40 if (last_run["minutes"] or 0) >= 35 else 35)
+    minutes = 30 if not last else (40 if last_minutes >= 35 else 35)
     running = {"name": "Running", "label": "Sone 2-løp", "sets": 1, "reps": f"{minutes} min", "weight_kg": None,
                "note": "Sone 2: ca. 60–70 % av makspuls, du skal klare å snakke i hele setninger. "
                        "Gå gjerne i bakkene – det er pulsen som styrer."}
-    if not last_run:
-        run_reason = "Ingen løpeturer registrert ennå, så vi bygger grunnformen med rolig tempo først."
+    if not last:
+        reason = "Ingen kondisøkter registrert ennå, så vi bygger grunnformen med rolig tempo først."
     elif last_long:
-        run_reason = "Restitusjonsscoren er for lav for intervaller i dag, så vi velger rolig sone 2 i stedet."
+        reason = "Restitusjonsscoren er for lav for intervaller i dag, så vi velger rolig sone 2 i stedet."
+    elif not last["minutes"]:
+        reason = "Siste kondisøkt ble logget uten tid, så vi velger en rolig og kontrollert sone 2-tur."
     else:
-        run_reason = (f"Siste løpetur var {_run_text(last_run)}. Forrige gang var kort og hard, "
-                      f"så i dag veksler vi til rolig og jevnt.")
-    why = [_alternation_reason(ctx), run_reason,
+        reason = (f"Siste kondisøkt var {_cardio_text(last)} – kort og intensiv, "
+                  f"så i dag veksler vi til rolig og jevnt.")
+    why = [_alternation_reason(ctx), reason,
            "Rolig sone 2-trening bygger flere mitokondrier og kapillærer, og på lav intensitet dekkes en "
-           "større andel av energien av fett.", readiness_text, fat_loss]
+           "større andel av energien av fett.", _recovery_reason(ctx), _fat_loss_reason(ctx)]
     return _finish("cardio", f"Kondis – sone 2-løp {minutes} min", minutes + 10, "Lett til moderat",
                    why, [running, core])
 
@@ -1352,18 +1499,17 @@ def _cardio_plan(ctx, fat_loss, readiness_text):
 def build_recommendation(ctx):
     """Rule-based (deterministic) suggestion for the next workout.
 
-    Priority: poor recovery score -> recovery day; long break -> gentle full-body comeback;
+    Priority: poor recovery score -> recovery day; long break -> gentle full-body restart;
     otherwise follow the strength/cardio alternation. `ctx["readiness"]` is None when
     Garmin data is missing or too old, and is then simply not used.
     """
-    fat_loss, readiness_text = _common_reasons(ctx)
     if ctx["readiness"] is not None and ctx["readiness"] < 45:
-        return _recovery_plan(ctx, fat_loss, readiness_text)
+        return _recovery_plan(ctx)
     if ctx["comeback_active"]:
-        return _comeback_plan(ctx, fat_loss, readiness_text)
+        return _comeback_plan(ctx)
     if ctx["next_kind"] == "strength":
-        return _strength_plan(ctx, fat_loss, readiness_text)
-    return _cardio_plan(ctx, fat_loss, readiness_text)
+        return _strength_plan(ctx)
+    return _cardio_plan(ctx)
 
 
 # ═══════════════════════════ Main entry point ═══════════════════════════
@@ -1378,6 +1524,21 @@ def _sources(sources, demo, garmin_days):
                 result[key] = str(sources[key])
         result["errors"] = [str(e) for e in _as_list(sources.get("errors"))]
     return result
+
+
+def _coerce_now(now):
+    """A timezone-aware datetime from `now` (datetime or ISO text), or None if unusable.
+
+    Naive datetimes are taken to be Oslo time.
+    """
+    if isinstance(now, str):
+        try:
+            now = datetime.fromisoformat(now.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(now, datetime):
+        return None
+    return now if now.tzinfo else now.replace(tzinfo=LOCAL_TZ)
 
 
 def build_dashboard(workouts, template_muscles, garmin_days, weights, today, now,
@@ -1395,20 +1556,21 @@ def build_dashboard(workouts, template_muscles, garmin_days, weights, today, now
             so a run at 23:30 UTC in September lands on the next day in Norway. A naive
             or missing `now` falls back to Europe/Oslo, the zone routes.py uses for `today`.
     """
-    if isinstance(today, datetime):
-        today = today.date()
+    now = _coerce_now(now)
+    today = _parse_date(today)
+    if today is None:        # last resort: the date from `now`, else the real clock
+        today = now.date() if now else datetime.now(LOCAL_TZ).date()
     template_muscles = template_muscles if isinstance(template_muscles, dict) else {}
     if garmin_days is not None and not isinstance(garmin_days, list):
         garmin_days = []
     if not isinstance(now, datetime):
         now = datetime.combine(today, time(12, 0), tzinfo=LOCAL_TZ)
-    elif now.tzinfo is None:
-        now = now.replace(tzinfo=LOCAL_TZ)
     tz = now.tzinfo
 
     workouts_clean = [w for w in normalize_workouts(workouts, template_muscles, tz) if w["date"] <= today]
-    runs = collect_runs(workouts_clean, garmin_days, today)
-    sessions = build_sessions(workouts_clean, runs)
+    cardio = collect_cardio(workouts_clean, garmin_days, today)
+    runs = runs_only(cardio)
+    sessions = build_sessions(workouts_clean, cardio)
 
     consistency = build_consistency(sessions, today)
     days_since = consistency["days_since_last"]
@@ -1441,7 +1603,7 @@ def build_dashboard(workouts, template_muscles, garmin_days, weights, today, now
         "days_since_last": days_since, "comeback_active": comeback["active"],
         "strength_days_off": strength_days_off, "last_kind": balance["last_kind"],
         "next_kind": balance["next_kind"], "neglected": neglected, "weight": weight,
-        "progressions": progressions, "last_dates": last_dates, "runs": runs,
+        "progressions": progressions, "last_dates": last_dates, "cardio": cardio,
     })
 
     # Progression list: exercises in today's plan first, then the most recently trained.

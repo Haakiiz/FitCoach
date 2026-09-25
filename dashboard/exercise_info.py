@@ -283,9 +283,11 @@ def equipment_kind(title):
 
 
 def to_number(value):
-    """Safe float conversion: numbers and numeric strings -> float; None/bool/text/NaN/inf -> None."""
+    """Safe float conversion: numbers and numeric strings ("22", "96,4") -> float; None/bool/text/NaN/inf -> None."""
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, str):
+        value = value.strip().replace(",", ".")        # Norwegian decimal comma: "96,4"
     try:
         number = float(value)
     except (TypeError, ValueError):

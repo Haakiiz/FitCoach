@@ -6,9 +6,12 @@ Everything runs in demo mode or with fake ("mock") clients. No test ever
 talks to HEVY or Garmin: real network access is blocked by a fixture.
 """
 import asyncio
+import hashlib
+import hmac
 import importlib
 import json
 import logging
+import threading
 import sys
 import time
 import types
@@ -72,9 +75,17 @@ def fresh_source_state(monkeypatch):
     monkeypatch.setattr(sources, "_garmin_lock", asyncio.Lock())
     monkeypatch.setattr(sources, "_workouts_cache", {"fetched_at": 0.0, "workouts": None})
     monkeypatch.setattr(sources, "_garmin_cache",
-                        {"fetched_at": 0.0, "key": None, "days": None, "error": None, "error_at": 0.0})
+                        {"fetched_at": 0.0, "key": None, "days": None,
+                         "error": None, "error_at": 0.0, "error_is_login": False})
     monkeypatch.setattr(sources, "_garmin_client", None)
+    monkeypatch.setattr(sources, "_garmin_task", None)
+    monkeypatch.setattr(sources, "_garmin_task_key", None)
+    monkeypatch.setattr(sources, "_garmin_generation", 0)
     monkeypatch.setattr(sources, "_password_login_blocked", False)
+    monkeypatch.setattr(sources, "_password_unblocked_at", float("-inf"))
+    from dashboard import routes
+    monkeypatch.setattr(routes, "_weight_lock", asyncio.Lock())
+    monkeypatch.setattr(routes, "_login_lock", asyncio.Lock())
 
 
 @pytest.fixture
@@ -144,8 +155,23 @@ def test_api_returns_demo_data(client):
     assert resp.headers["cache-control"] == "no-store"
 
 
-def test_api_refresh(client):
+def test_refresh_only_with_header(client, monkeypatch):
+    """Fresh data only with the header X-FitCoach-Refresh: 1 (an <img> can't send headers)."""
+    from dashboard import routes
+    seen = []
+    real_build_data = routes.build_data
+
+    async def spy(force=False):
+        seen.append(force)
+        return await real_build_data(force=force)
+
+    monkeypatch.setattr(routes, "build_data", spy)
+    assert client.get("/dashboard/api", headers={"X-FitCoach-Refresh": "1"}).status_code == 200
     assert client.get("/dashboard/api?refresh=1").status_code == 200
+    assert client.get("/dashboard/api", headers={"X-FitCoach-Refresh": "yes"}).status_code == 200
+    assert client.get("/dashboard?refresh=1").status_code == 200
+    assert client.get("/dashboard", headers={"X-FitCoach-Refresh": "1"}).status_code == 200
+    assert seen == [True, False, False, False, False]
 
 
 def test_comeback_scenario(client, monkeypatch):
@@ -204,7 +230,8 @@ def test_page_fallback_when_template_missing(client, monkeypatch, tmp_path):
 
 # ─── POST /dashboard/weight ───
 
-def test_weight_post_ok_and_same_date_replaced(client, tmp_path):
+def test_demo_weight_is_memory_only_and_same_date_replaced(client, tmp_path):
+    """In demo mode a weigh-in is kept in memory only, even when WEIGHTS_PATH is set."""
     day = (date.today() - timedelta(days=1)).isoformat()
     resp = client.post("/dashboard/weight", json={"kg": 95.8, "date": day})
     assert resp.status_code == 200
@@ -213,18 +240,18 @@ def test_weight_post_ok_and_same_date_replaced(client, tmp_path):
     assert {"date": day, "kg": 95.8} in body["weight"]["entries"]
 
     # Same date again → replaced, not duplicated
-    client.post("/dashboard/weight", json={"kg": "95,6", "date": day})
+    body = client.post("/dashboard/weight", json={"kg": "95,6", "date": day}).json()
+    same_day = [e for e in body["weight"]["entries"] if e["date"] == day]
+    assert same_day == [{"date": day, "kg": 95.6}]
+    assert not (tmp_path / "weights.json").exists()   # nothing written to disk
+
+
+def test_real_mode_weight_is_saved_to_file(local_client, no_demo, tmp_path):
+    day = (date.today() - timedelta(days=1)).isoformat()
+    assert local_client.post("/dashboard/weight", json={"kg": 95.8, "date": day}).status_code == 200
+    assert local_client.post("/dashboard/weight", json={"kg": "95,6", "date": day}).status_code == 200
     saved = json.loads((tmp_path / "weights.json").read_text(encoding="utf-8"))
     assert saved == [{"date": day, "kg": 95.6}]
-
-
-def test_weight_post_in_memory_when_no_weights_path(client, monkeypatch):
-    monkeypatch.delenv("WEIGHTS_PATH")
-    day = (date.today() - timedelta(days=2)).isoformat()
-    body = client.post("/dashboard/weight", json={"kg": 97.0, "date": day}).json()
-    assert body["ok"] is True
-    assert {"date": day, "kg": 97.0} in body["weight"]["entries"]
-    assert not (PROJECT_DIR / "weights.json").exists() or "97.0" not in (PROJECT_DIR / "weights.json").read_text()
 
 
 @pytest.mark.parametrize("payload", [
@@ -243,6 +270,10 @@ def test_weight_post_in_memory_when_no_weights_path(client, monkeypatch):
     {"kg": "nan"},
     {"kg": None},
     {"kg": {"a": 1}},
+    {"kg": "96_4"},
+    {"kg": "٩٦"},
+    {"kg": "9"},
+    {"kg": 95, "date": "20260901"},
 ])
 def test_weight_post_invalid(client, payload):
     resp = client.post("/dashboard/weight", json=payload)
@@ -252,9 +283,62 @@ def test_weight_post_invalid(client, payload):
     assert body["error"]
 
 
-def test_weight_post_not_json(client):
-    resp = client.post("/dashboard/weight", content=b"kg=95", headers={"content-type": "text/plain"})
+@pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded",
+                                          "multipart/form-data", None])
+def test_weight_post_must_be_json(client, content_type):
+    headers = {"content-type": content_type} if content_type else {}
+    resp = client.post("/dashboard/weight", content=b'{"kg": 95}', headers=headers)
+    assert resp.status_code == 415
+
+
+def test_weight_post_json_with_charset_ok(client):
+    resp = client.post("/dashboard/weight", content=b'{"kg": 95}',
+                       headers={"content-type": "application/json; charset=utf-8"})
+    assert resp.status_code == 200
+
+
+def test_weight_post_broken_json(client):
+    resp = client.post("/dashboard/weight", content=b"{kg: 95", headers={"content-type": "application/json"})
     assert resp.status_code == 400
+
+
+# ─── CSRF: other websites can't post to us ───
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "https://evil.example"},
+    {"Origin": "null"},
+    {"Origin": "http://testserver.evil.example"},
+    {"Sec-Fetch-Site": "cross-site"},
+    {"Sec-Fetch-Site": "same-site"},
+    {"Origin": "http://testserver", "Sec-Fetch-Site": "cross-site"},
+])
+def test_cross_site_posts_are_refused(client, headers):
+    assert client.post("/dashboard/weight", json={"kg": 95}, headers=headers).status_code == 403
+
+
+@pytest.mark.parametrize("headers", [
+    {},
+    {"Origin": "http://testserver"},
+    {"Sec-Fetch-Site": "same-origin"},
+    {"Sec-Fetch-Site": "none"},
+    {"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
+])
+def test_same_origin_posts_are_allowed(client, headers):
+    assert client.post("/dashboard/weight", json={"kg": 95}, headers=headers).status_code == 200
+
+
+def test_same_origin_behind_ngrok_host_rewrite(client):
+    """ngrok with --host-header=rewrite: Host is local, the real host is in X-Forwarded-Host."""
+    headers = {"Origin": "https://abc.ngrok-free.app", "X-Forwarded-Host": "abc.ngrok-free.app",
+               "X-Forwarded-Proto": "https"}
+    assert client.post("/dashboard/weight", json={"kg": 95}, headers=headers).status_code == 200
+
+
+def test_cross_site_login_is_refused(client, with_token):
+    resp = client.post("/dashboard/login", data={"token": TOKEN}, follow_redirects=False,
+                       headers={"Origin": "https://evil.example"})
+    assert resp.status_code == 403
+    assert "set-cookie" not in resp.headers
 
 
 # ─── DASHBOARD_TOKEN: login form, cookie and Bearer header ───
@@ -289,7 +373,8 @@ def test_token_flow(client, simple_template, with_token):
     assert "set-cookie" not in resp.headers
 
     # Right token (sent in the POST body) → cookie + redirect to /dashboard
-    resp = client.post("/dashboard/login", data={"token": TOKEN}, follow_redirects=False)
+    resp = client.post("/dashboard/login", data={"token": TOKEN}, follow_redirects=False,
+                       headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"})
     assert resp.status_code == 303
     assert resp.headers["location"] == "/dashboard"
     cookie = resp.headers["set-cookie"]
@@ -298,7 +383,9 @@ def test_token_flow(client, simple_template, with_token):
     assert "samesite=lax" in cookie.lower()
     assert "Max-Age=7776000" in cookie
     assert "Secure" not in cookie          # plain http in the test
-    assert TOKEN not in cookie             # the cookie holds a hash, not the token
+    assert TOKEN not in cookie             # the cookie holds an HMAC, not the token
+    expected = hmac.new(TOKEN.encode(), b"fitcoach-dash-v1", hashlib.sha256).hexdigest()
+    assert f"fitcoach_dash={expected}" in cookie
 
     # The TestClient keeps the cookie → now everything works
     assert client.get("/dashboard").status_code == 200
@@ -367,8 +454,15 @@ def test_no_token_outside_ip_is_refused(app, no_demo, host):
 
 @pytest.mark.parametrize("header", [
     {"X-Forwarded-For": "8.8.8.8"},
+    {"X-Forwarded-For": ""},
     {"X-Forwarded-Host": "abc.ngrok-free.app"},
+    {"X-Forwarded-Proto": "https"},
     {"Forwarded": "for=8.8.8.8;proto=https"},
+    {"X-Real-IP": "8.8.8.8"},
+    {"Via": "1.1 ngrok"},
+    {"CF-Connecting-IP": "8.8.8.8"},
+    {"True-Client-IP": "8.8.8.8"},
+    {"X-Client-IP": "8.8.8.8"},
 ])
 def test_no_token_proxied_request_is_refused(local_client, no_demo, header):
     """ngrok connects from 127.0.0.1 but adds forwarding headers → treated as outside."""
@@ -397,9 +491,50 @@ def test_access_log_filter_leaves_other_lines_alone():
     from dashboard.routes import MaskKeyFilter
     record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1,
                                '%s - "%s %s HTTP/%s" %d',
-                               ("1.2.3.4:5", "GET", "/workouts?page=1&monkey=2", "1.1", 200), None)
+                               ("1.2.3.4:5", "GET", "/workouts?page=1&pageSize=10", "1.1", 200), None)
     assert MaskKeyFilter().filter(record) is True
-    assert record.getMessage() == '1.2.3.4:5 - "GET /workouts?page=1&monkey=2 HTTP/1.1" 200'
+    assert record.getMessage() == '1.2.3.4:5 - "GET /workouts?page=1&pageSize=10 HTTP/1.1" 200'
+
+
+@pytest.mark.parametrize("text, secret", [
+    ("/dashboard?token=abc123", "abc123"),
+    ("/x?user=a&password=hunter2&y=1", "hunter2"),
+    ("/x?api_key=zzz999", "zzz999"),
+    ("/x?access_token=tok777", "tok777"),
+    ("Authorization: Bearer sekret-bearer", "sekret-bearer"),
+    ("{'authorization': 'Basic dXNlcjpwYXNz'}", "dXNlcjpwYXNz"),
+])
+def test_access_log_filter_masks_other_secrets(text, secret):
+    from dashboard.routes import MaskKeyFilter
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, "%s", (text,), None)
+    MaskKeyFilter().filter(record)
+    assert secret not in record.getMessage()
+    assert "***" in record.getMessage()
+
+
+def test_failed_logins_are_answered_one_at_a_time(app, with_token, monkeypatch):
+    from dashboard import routes
+    monkeypatch.setattr(routes, "LOGIN_FAIL_DELAY", 0.2)
+
+    async def three_wrong_guesses_at_once():
+        routes._login_lock = asyncio.Lock()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            start = time.monotonic()
+            answers = await asyncio.gather(*[
+                ac.post("/dashboard/login", data={"token": f"guess{i}"}) for i in range(3)])
+            return time.monotonic() - start, [a.status_code for a in answers]
+
+    elapsed, codes = asyncio.run(three_wrong_guesses_at_once())
+    assert codes == [401, 401, 401]
+    assert elapsed >= 0.55   # 3 × 0.2 s one after another, not 0.2 s in parallel
+
+
+def test_changing_the_token_logs_everyone_out(client, with_token, monkeypatch):
+    client.post("/dashboard/login", data={"token": TOKEN})
+    assert client.get("/dashboard/api").status_code == 200
+    monkeypatch.setenv("DASHBOARD_TOKEN", "a-brand-new-token")
+    assert client.get("/dashboard/api").status_code == 401
 
 
 def test_install_adds_the_filter_only_once(app):
@@ -424,6 +559,16 @@ def test_gpt_endpoints_survive_missing_dashboard(app, monkeypatch):
     importlib.reload(hevy_proxy)   # put the normal app back for the other tests
     assert "/workouts" in paths and "/exercise_templates/all" in paths
     assert "/dashboard" not in paths
+
+
+def test_gpt_endpoints_answer_503_without_api_key(client, monkeypatch):
+    import hevy_proxy
+    monkeypatch.setattr(hevy_proxy, "HEVY_API_KEY", None)
+    resp = client.get("/workouts")
+    assert resp.status_code == 503
+    assert "HEVY_API_KEY mangler" in resp.json()["detail"]
+    resp = client.post("/workouts", json={"workout": {"exercises": []}})
+    assert resp.status_code == 503
 
 
 # ─── The GPT's OpenAPI schema must not change ───
@@ -610,6 +755,30 @@ def test_garmin_not_configured_returns_none(monkeypatch):
     assert asyncio.run(sources.fetch_garmin_days()) is None
 
 
+def test_atomic_write_fsyncs_before_replace(tmp_path, monkeypatch):
+    from dashboard import sources
+    order = []
+    real_fsync, real_replace = sources.os.fsync, sources.os.replace
+    monkeypatch.setattr(sources.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(sources.os, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    sources._write_json_atomic(tmp_path / "x.json", [1, 2])
+    assert order == ["fsync", "replace"]
+    assert json.loads((tmp_path / "x.json").read_text()) == [1, 2]
+
+
+@pytest.mark.parametrize("text", ["96_4", "٩٦", "９６", "1e2", "9", "1000", "96,456", "96.", ",5", " ", "96 4"])
+def test_weight_text_must_be_plain_digits(text):
+    from dashboard import sources
+    with pytest.raises(ValueError):
+        sources.validate_weight(text, None, date(2026, 9, 24))
+
+
+@pytest.mark.parametrize("text, kg", [("96", 96.0), ("96,4", 96.4), ("96.45", 96.45), (" 105 ", 105.0)])
+def test_weight_text_ok(text, kg):
+    from dashboard import sources
+    assert sources.validate_weight(text, None, date(2026, 9, 24))[0] == kg
+
+
 def test_add_weight_file(tmp_path):
     from dashboard import sources
     path = tmp_path / "w.json"
@@ -631,34 +800,68 @@ def garmin_env(monkeypatch):
     monkeypatch.setenv("GARMIN_PASSWORD", "hemmelig")
 
 
-def test_garmin_timeout_is_cached_as_error(monkeypatch, garmin_env):
+def test_garmin_timeout_then_busy_then_result_is_picked_up(monkeypatch, garmin_env):
     from dashboard import sources
     calls = []
+    release = threading.Event()
 
     def slow(days, today):
         calls.append(1)
-        time.sleep(0.3)
-        return []
+        release.wait(5)
+        return [sources.empty_garmin_day("2026-09-24") | {"steps": 1234}]
 
     monkeypatch.setattr(sources, "_fetch_garmin_days_sync", slow)
     monkeypatch.setattr(sources, "GARMIN_TIMEOUT_SECONDS", 0.05)
 
     async def scenario():
         with pytest.raises(sources.GarminError, match="svarte ikke"):
-            await sources.fetch_garmin_days(7, today=date(2026, 9, 24))
-        # Within 20 minutes: the cached error comes back without asking Garmin again
-        with pytest.raises(sources.GarminError, match="svarte ikke"):
-            await sources.fetch_garmin_days(7, today=date(2026, 9, 24))
+            await sources.fetch_garmin_days(1, today=date(2026, 9, 24))
+        # Still running: no new thread, not even with force (the "Oppdater" button)
+        for force in (False, True, True):
+            with pytest.raises(sources.GarminError, match="holder fortsatt på"):
+                await sources.fetch_garmin_days(1, force=force, today=date(2026, 9, 24))
         assert len(calls) == 1
-        # ?refresh=1 (force) tries again
-        with pytest.raises(sources.GarminError):
-            await sources.fetch_garmin_days(7, force=True, today=date(2026, 9, 24))
-        assert len(calls) == 2
+        # The thread finishes → the next call picks up its result
+        release.set()
+        while not sources._garmin_task.done():
+            await asyncio.sleep(0.01)
+        days = await sources.fetch_garmin_days(1, today=date(2026, 9, 24))
+        assert days[0]["steps"] == 1234
+        assert len(calls) == 1
 
     asyncio.run(scenario())
 
 
-def test_garmin_error_expires_after_20_minutes(monkeypatch, garmin_env):
+def test_never_more_than_one_garmin_thread(monkeypatch, garmin_env):
+    """Same idea as the critic's racetest.py: many forced refreshes, slow Garmin."""
+    from dashboard import sources
+    active, peak, lock = [0], [0], threading.Lock()
+
+    def slow(days, today):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.3)
+        with lock:
+            active[0] -= 1
+        return []
+
+    monkeypatch.setattr(sources, "_fetch_garmin_days_sync", slow)
+    monkeypatch.setattr(sources, "GARMIN_TIMEOUT_SECONDS", 0.05)
+
+    async def scenario():
+        for _ in range(5):
+            with pytest.raises(sources.GarminError):
+                await sources.fetch_garmin_days(7, force=True, today=date(2026, 9, 24))
+        await asyncio.gather(*[sources.fetch_garmin_days(7, force=True, today=date(2026, 9, 24))
+                               for _ in range(5)], return_exceptions=True)
+        await asyncio.sleep(0.4)
+
+    asyncio.run(scenario())
+    assert peak[0] == 1
+
+
+def test_garmin_error_is_cached_for_20_minutes(monkeypatch, garmin_env):
     from dashboard import sources
     calls = []
 
@@ -675,28 +878,48 @@ def test_garmin_error_expires_after_20_minutes(monkeypatch, garmin_env):
     with pytest.raises(sources.GarminError):
         asyncio.run(sources.fetch_garmin_days(7, today=date(2026, 9, 24)))
     assert len(calls) == 2
+    # force (the "Oppdater" button) skips the error cache
+    with pytest.raises(sources.GarminError):
+        asyncio.run(sources.fetch_garmin_days(7, force=True, today=date(2026, 9, 24)))
+    assert len(calls) == 3
 
 
-def test_garmin_lock_means_one_fetch_at_a_time(monkeypatch, garmin_env):
+def test_given_up_job_does_not_save_its_client(monkeypatch, garmin_env):
+    """If a failure was handled while a job was logging in, the job must not store its client."""
     from dashboard import sources
-    calls = []
 
-    def fetch(days, today):
-        calls.append(1)
-        time.sleep(0.1)
-        return [sources.empty_garmin_day("2026-09-24")]
+    def login_while_error_is_handled():
+        sources._garmin_generation += 1   # as if a failed job had been handled meanwhile
+        return FakeGarmin()
 
-    monkeypatch.setattr(sources, "_fetch_garmin_days_sync", fetch)
+    monkeypatch.setattr(sources, "_garmin_login", login_while_error_is_handled)
+    sources._fetch_garmin_days_sync(1, date(2026, 9, 24))
+    assert sources._garmin_client is None
 
-    async def two_at_once():
-        return await asyncio.gather(
-            sources.fetch_garmin_days(1, today=date(2026, 9, 24)),
-            sources.fetch_garmin_days(1, today=date(2026, 9, 24)),
-        )
+    # Normal case: the client is kept for the next fetch
+    monkeypatch.setattr(sources, "_garmin_login", lambda: FakeGarmin())
+    sources._fetch_garmin_days_sync(1, date(2026, 9, 24))
+    assert isinstance(sources._garmin_client, FakeGarmin)
 
-    first, second = asyncio.run(two_at_once())
-    assert first == second
-    assert len(calls) == 1   # the second call waited and then used the cache
+
+def test_garmin_days_are_fetched_at_most_4_at_a_time(monkeypatch, garmin_env):
+    from dashboard import sources
+    active, peak, lock = [0], [0], threading.Lock()
+
+    class CountingGarmin(FakeGarmin):
+        def get_sleep_data(self, day):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.05)
+            with lock:
+                active[0] -= 1
+            return super().get_sleep_data(day)
+
+    monkeypatch.setattr(sources, "_garmin_login", lambda: CountingGarmin())
+    days = sources._fetch_garmin_days_sync(7, date(2026, 9, 24))
+    assert [d["date"] for d in days] == [f"2026-09-{n}" for n in range(18, 25)]   # still in order
+    assert 1 < peak[0] <= 4
 
 
 class FakeGarminLogin:
@@ -737,10 +960,19 @@ def test_password_login_is_not_retried_after_failure(monkeypatch, garmin_env, tm
     with pytest.raises(sources.GarminLoginError):
         asyncio.run(sources.fetch_garmin_days(7, today=date(2026, 9, 24)))
     assert FakeGarminLogin.password_tries == 1
-    # …but ?refresh=1 (force=True) allows one new password login
+    # …but "Oppdater" (force=True) allows one new password login
     with pytest.raises(sources.GarminLoginError, match="MFA"):
         asyncio.run(sources.fetch_garmin_days(7, force=True, today=date(2026, 9, 24)))
     assert FakeGarminLogin.password_tries == 2
+    # …and only once per 10 minutes, however often you press it
+    for _ in range(3):
+        with pytest.raises(sources.GarminLoginError, match="Oppdater"):
+            asyncio.run(sources.fetch_garmin_days(7, force=True, today=date(2026, 9, 24)))
+    assert FakeGarminLogin.password_tries == 2
+    sources._password_unblocked_at -= sources.PASSWORD_RETRY_SECONDS + 1   # pretend 10 min passed
+    with pytest.raises(sources.GarminLoginError, match="MFA"):
+        asyncio.run(sources.fetch_garmin_days(7, force=True, today=date(2026, 9, 24)))
+    assert FakeGarminLogin.password_tries == 3
 
 
 def test_garmin_timeout_shows_on_page(local_client, monkeypatch, garmin_env):
@@ -864,6 +1096,8 @@ def test_demo_data_shape():
     for w in active:
         for ex in w["exercises"]:
             assert ex["exercise_template_id"] in muscles
+            # Same keys as the real HEVY GET /v1/workouts answer (it uses "superset_id")
+            assert set(ex) == {"index", "title", "notes", "exercise_template_id", "superset_id", "sets"}
             for s in ex["sets"]:
                 assert set(s) == {"index", "type", "weight_kg", "reps", "distance_meters",
                                   "duration_seconds", "rpe", "custom_metric"}
